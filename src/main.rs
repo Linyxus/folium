@@ -1,26 +1,63 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![allow(non_snake_case)]
 
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
+use std::sync::OnceLock;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
-    NSButton, NSLayoutConstraint, NSModalResponseOK, NSOpenPanel, NSSplitView,
-    NSSplitViewDividerStyle, NSTextField, NSToolbar, NSToolbarDelegate,
-    NSToolbarFlexibleSpaceItemIdentifier, NSToolbarItem, NSView, NSVisualEffectBlendingMode,
-    NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindow, NSWindowStyleMask,
-    NSWindowToolbarStyle,
+    NSBitmapFormat, NSBitmapImageRep, NSButton, NSImage, NSImageScaling, NSImageView,
+    NSLayoutConstraint, NSModalResponseOK, NSOpenPanel, NSScrollView, NSTextField, NSToolbar,
+    NSToolbarDelegate, NSToolbarFlexibleSpaceItemIdentifier, NSToolbarItem, NSView,
+    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
+    NSWindow, NSWindowStyleMask, NSWindowToolbarStyle,
 };
 use objc2_foundation::{
-    ns_string, MainThreadMarker, NSArray, NSNotification, NSNotificationCenter, NSObject,
-    NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSURL,
+    ns_string, MainThreadMarker, NSArray, NSNotification, NSObject, NSObjectProtocol, NSPoint,
+    NSRect, NSSize, NSString, NSURL,
 };
-use objc2_pdf_kit::{
-    PDFDisplayMode, PDFDocument, PDFThumbnailView, PDFView, PDFViewPageChangedNotification,
-};
+use pdfium_render::prelude::*;
+
+// ---------------------------------------------------------------------------
+// Global Pdfium instance (single-threaded macOS app, safe to assert Send+Sync)
+// ---------------------------------------------------------------------------
+
+struct SendSyncPdfium(Pdfium);
+unsafe impl Send for SendSyncPdfium {}
+unsafe impl Sync for SendSyncPdfium {}
+
+fn get_pdfium() -> &'static Pdfium {
+    static INSTANCE: OnceLock<SendSyncPdfium> = OnceLock::new();
+    &INSTANCE
+        .get_or_init(|| {
+            let dylib = std::env::current_exe()
+                .expect("cannot resolve executable path")
+                .parent()
+                .expect("executable has no parent directory")
+                .join("libpdfium.dylib");
+            SendSyncPdfium(Pdfium::new(
+                Pdfium::bind_to_library(&dylib).unwrap_or_else(|e| {
+                    panic!("failed to load {}: {e}", dylib.display())
+                }),
+            ))
+        })
+        .0
+}
+
+// ---------------------------------------------------------------------------
+// PDF state
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct PdfStateData {
+    bytes: Vec<u8>,
+    page_count: usize,
+    current_page: usize,
+    scale: f32,
+}
 
 // ---------------------------------------------------------------------------
 // ToolbarHandler — toolbar delegate + action target
@@ -28,8 +65,9 @@ use objc2_pdf_kit::{
 
 #[derive(Debug, Default)]
 struct ToolbarHandlerIvars {
-    pdf_view: OnceCell<Retained<PDFView>>,
+    image_view: OnceCell<Retained<NSImageView>>,
     page_label: OnceCell<Retained<NSTextField>>,
+    pdf_state: RefCell<Option<PdfStateData>>,
 }
 
 define_class!(
@@ -199,7 +237,7 @@ define_class!(
         }
     }
 
-    // Non-protocol ObjC action methods and notification observer
+    // Non-protocol ObjC action methods
     impl ToolbarHandler {
         #[unsafe(method(openDocument:))]
         fn open_document(&self, _sender: Option<&AnyObject>) {
@@ -220,38 +258,53 @@ define_class!(
         }
 
         #[unsafe(method(prevPage:))]
-        fn prev_page(&self, _sender: Option<&AnyObject>) {
-            if let Some(pdf_view) = self.ivars().pdf_view.get() {
-                unsafe { pdf_view.goToPreviousPage(None) };
-                self.update_page_label();
+        fn prev_page(&self, _: Option<&AnyObject>) {
+            {
+                let mut s = self.ivars().pdf_state.borrow_mut();
+                if let Some(s) = s.as_mut() {
+                    if s.current_page > 0 {
+                        s.current_page -= 1;
+                    } else {
+                        return;
+                    }
+                }
             }
+            self.render_current_page();
         }
 
         #[unsafe(method(nextPage:))]
-        fn next_page(&self, _sender: Option<&AnyObject>) {
-            if let Some(pdf_view) = self.ivars().pdf_view.get() {
-                unsafe { pdf_view.goToNextPage(None) };
-                self.update_page_label();
+        fn next_page(&self, _: Option<&AnyObject>) {
+            {
+                let mut s = self.ivars().pdf_state.borrow_mut();
+                if let Some(s) = s.as_mut() {
+                    if s.current_page + 1 < s.page_count {
+                        s.current_page += 1;
+                    } else {
+                        return;
+                    }
+                }
             }
+            self.render_current_page();
         }
 
         #[unsafe(method(zoomIn:))]
-        fn zoom_in(&self, _sender: Option<&AnyObject>) {
-            if let Some(pdf_view) = self.ivars().pdf_view.get() {
-                unsafe { pdf_view.zoomIn(None) };
+        fn zoom_in(&self, _: Option<&AnyObject>) {
+            {
+                if let Some(s) = self.ivars().pdf_state.borrow_mut().as_mut() {
+                    s.scale *= 1.25;
+                }
             }
+            self.render_current_page();
         }
 
         #[unsafe(method(zoomOut:))]
-        fn zoom_out(&self, _sender: Option<&AnyObject>) {
-            if let Some(pdf_view) = self.ivars().pdf_view.get() {
-                unsafe { pdf_view.zoomOut(None) };
+        fn zoom_out(&self, _: Option<&AnyObject>) {
+            {
+                if let Some(s) = self.ivars().pdf_state.borrow_mut().as_mut() {
+                    s.scale /= 1.25;
+                }
             }
-        }
-
-        #[unsafe(method(pageChanged:))]
-        fn page_changed(&self, _notification: &NSNotification) {
-            self.update_page_label();
+            self.render_current_page();
         }
     }
 );
@@ -263,35 +316,77 @@ impl ToolbarHandler {
     }
 
     fn load_url(&self, url: &NSURL) {
-        let Some(pdf_view) = self.ivars().pdf_view.get() else {
-            return;
+        let path = url.path().expect("URL has no path");
+        let bytes = std::fs::read(path.to_string()).expect("failed to read PDF");
+        let page_count = {
+            let doc = get_pdfium()
+                .load_pdf_from_byte_slice(&bytes, None)
+                .expect("pdfium: failed to parse PDF");
+            doc.pages().len() as usize
         };
-        let doc = unsafe { PDFDocument::initWithURL(PDFDocument::alloc(), url) };
-        unsafe { pdf_view.setDocument(doc.as_deref()) };
-        self.update_page_label();
+        *self.ivars().pdf_state.borrow_mut() = Some(PdfStateData {
+            bytes,
+            page_count,
+            current_page: 0,
+            scale: 2.0,
+        });
+        self.render_current_page();
     }
 
     fn update_page_label(&self) {
-        let Some(pdf_view) = self.ivars().pdf_view.get() else {
+        let Some(label) = self.ivars().page_label.get() else {
             return;
         };
-        let Some(page_label) = self.ivars().page_label.get() else {
+        let text = match self.ivars().pdf_state.borrow().as_ref() {
+            Some(s) => format!("{} of {}", s.current_page + 1, s.page_count),
+            None => String::new(),
+        };
+        label.setStringValue(&NSString::from_str(&text));
+    }
+
+    fn render_current_page(&self) {
+        let Some(image_view) = self.ivars().image_view.get() else {
             return;
         };
-        let doc = unsafe { pdf_view.document() };
-        let text = if let Some(doc) = &doc {
-            let page = unsafe { pdf_view.currentPage() };
-            let current = if let Some(page) = &page {
-                (unsafe { doc.indexForPage(page) }) + 1
-            } else {
-                0
+
+        // Extract pixel data inside a block so that `borrow`, `doc`, `page`, and
+        // `bitmap` are all dropped before we call `update_page_label` (which would
+        // re-borrow `pdf_state`).
+        let (mut rgba, w, h) = {
+            let borrow = self.ivars().pdf_state.borrow();
+            let Some(state) = borrow.as_ref() else {
+                return;
             };
-            let total = unsafe { doc.pageCount() };
-            format!("{current} of {total}")
-        } else {
-            String::new()
+
+            let doc = get_pdfium()
+                .load_pdf_from_byte_slice(&state.bytes, None)
+                .expect("pdfium: re-open failed");
+            let page = doc.pages().get(state.current_page as u16).expect("bad page index");
+
+            let px_w = (page.width().value * state.scale) as i32;
+            let px_h = (page.height().value * state.scale) as i32;
+            let bitmap = page
+                .render_with_config(&PdfRenderConfig::new().set_target_size(px_w, px_h))
+                .expect("pdfium render failed");
+
+            let img = bitmap.as_image();
+            let w = img.width() as usize;
+            let h = img.height() as usize;
+            let rgba = img.to_rgba8().into_raw();
+            (rgba, w, h)
+            // page, doc, borrow all dropped here
         };
-        page_label.setStringValue(&NSString::from_str(&text));
+
+        let ns_image = rgba_to_nsimage(&mut rgba, w, h);
+        image_view.setImage(Some(&ns_image));
+        image_view.setFrame(NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize {
+                width: w as f64,
+                height: h as f64,
+            },
+        ));
+        self.update_page_label();
     }
 }
 
@@ -386,71 +481,21 @@ fn build_window(mtm: MainThreadMarker, handler: &ToolbarHandler) -> Retained<NSW
     root_vev.setState(NSVisualEffectState::Active);
     window.setContentView(Some(&root_vev));
 
-    // --- PDFView (right pane) ---
-    handler
-        .ivars()
-        .pdf_view
-        .set(unsafe { PDFView::new(mtm) })
-        .unwrap();
-    let pdf_view = handler.ivars().pdf_view.get().unwrap();
-    unsafe {
-        pdf_view.setDisplayMode(PDFDisplayMode::SinglePageContinuous);
-        pdf_view.setAutoScales(true);
-    };
-    pdf_view.setTranslatesAutoresizingMaskIntoConstraints(false);
+    // --- NSScrollView fills the content area ---
+    let scroll = NSScrollView::new(mtm);
+    scroll.setHasHorizontalScroller(true);
+    scroll.setHasVerticalScroller(true);
+    scroll.setDrawsBackground(false);
+    root_vev.addSubview(&scroll);
+    pin_to_superview(&scroll, &root_vev);
 
-    // --- Sidebar: NSVisualEffectView (Sidebar material) ---
-    let sidebar = make_visual_effect_view(
-        mtm,
-        NSVisualEffectMaterial::Sidebar,
-        NSVisualEffectBlendingMode::BehindWindow,
-    );
-    sidebar.setState(NSVisualEffectState::Active);
-    sidebar.setTranslatesAutoresizingMaskIntoConstraints(false);
+    // --- NSImageView as document view (frame-based, not Auto Layout) ---
+    // NSImageScaling(2) == NSImageScaleNone
+    let image_view = NSImageView::new(mtm);
+    image_view.setImageScaling(NSImageScaling(2));
+    scroll.setDocumentView(Some(&*image_view));
 
-    // PDFThumbnailView inside sidebar
-    let thumb_view = unsafe { PDFThumbnailView::new(mtm) };
-    thumb_view.setTranslatesAutoresizingMaskIntoConstraints(false);
-    unsafe {
-        thumb_view.setThumbnailSize(NSSize {
-            width: 120.0,
-            height: 150.0,
-        });
-        thumb_view.setPDFView(Some(pdf_view));
-    };
-    sidebar.addSubview(&thumb_view);
-    pin_to_superview(&thumb_view, &sidebar);
-
-    // --- NSSplitView ---
-    let split = NSSplitView::new(mtm);
-    split.setVertical(true);
-    split.setDividerStyle(NSSplitViewDividerStyle::Thin);
-    split.setTranslatesAutoresizingMaskIntoConstraints(false);
-
-    split.addArrangedSubview(&sidebar);
-    split.addArrangedSubview(pdf_view);
-
-    // Pin sidebar width
-    sidebar
-        .widthAnchor()
-        .constraintEqualToConstant(220.0)
-        .setActive(true);
-
-    root_vev.addSubview(&split);
-    pin_to_superview(&split, &root_vev);
-
-    // --- Register for page-changed notifications ---
-    let observer: &AnyObject =
-        unsafe { &*(handler as *const ToolbarHandler as *const AnyObject) };
-    let nc = NSNotificationCenter::defaultCenter();
-    unsafe {
-        nc.addObserver_selector_name_object(
-            observer,
-            sel!(pageChanged:),
-            Some(PDFViewPageChangedNotification),
-            None,
-        );
-    };
+    handler.ivars().image_view.set(image_view).unwrap();
 
     window
 }
@@ -470,7 +515,7 @@ fn make_visual_effect_view(
     view
 }
 
-/// Pin all four edges of `view` to `superview`.
+/// Pin all four edges of `view` to `superview` using Auto Layout.
 fn pin_to_superview(view: &NSView, superview: &NSView) {
     view.setTranslatesAutoresizingMaskIntoConstraints(false);
     NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
@@ -483,6 +528,44 @@ fn pin_to_superview(view: &NSView, superview: &NSView) {
         view.trailingAnchor()
             .constraintEqualToAnchor(&superview.trailingAnchor()),
     ]));
+}
+
+/// Convert a raw RGBA buffer into an `NSImage` via `NSBitmapImageRep`.
+/// `NSBitmapImageRep` copies the pixel data during init, so `rgba` can be
+/// dropped after this function returns.
+fn rgba_to_nsimage(rgba: &mut Vec<u8>, w: usize, h: usize) -> Retained<NSImage> {
+    unsafe {
+        // The init method expects a pointer to a C array of plane pointers.
+        // For packed (non-planar) RGBA we provide a single pointer.
+        let mut plane: *mut u8 = rgba.as_mut_ptr();
+        let planes: *mut *mut u8 = &raw mut plane;
+
+        let rep = NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bitmapFormat_bytesPerRow_bitsPerPixel(
+            NSBitmapImageRep::alloc(),
+            planes,
+            w as isize,
+            h as isize,
+            8,               // bitsPerSample
+            4,               // samplesPerPixel (RGBA)
+            true,            // hasAlpha
+            false,           // isPlanar
+            objc2_app_kit::NSDeviceRGBColorSpace,
+            NSBitmapFormat(0),
+            (w * 4) as isize, // bytesPerRow
+            32,              // bitsPerPixel
+        )
+        .expect("NSBitmapImageRep init failed");
+
+        let img = NSImage::initWithSize(
+            NSImage::alloc(),
+            NSSize {
+                width: w as f64,
+                height: h as f64,
+            },
+        );
+        img.addRepresentation(&rep);
+        img
+    }
 }
 
 // ---------------------------------------------------------------------------

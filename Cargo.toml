@@ -1,0 +1,46 @@
+[package]
+name = "folium"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", features = [
+    "NSString",
+    "NSArray",
+    "NSObject",
+    "NSURL",
+    "NSNotification",
+] }
+objc2-app-kit = { version = "0.3.2", features = [
+    "NSApplication",
+    "NSWindow",
+    "NSScreen",
+    "NSView",
+    "NSResponder",
+    "NSVisualEffectView",
+    "NSLayoutConstraint",
+    "NSControl",
+    "NSButton",
+    "NSTextField",
+    "NSColor",
+    "NSFont",
+    "NSImage",
+    "NSText",
+    "NSRunningApplication",
+    "NSGraphics",
+    "NSUserInterfaceLayout",
+    "NSToolbar",
+    "NSToolbarItem",
+    "NSSplitView",
+    "NSOpenPanel",
+    "NSSavePanel",
+    "NSPanel",
+] }
+objc2-pdf-kit = { version = "0.3.2", features = [
+    "PDFView",
+    "PDFDocument",
+    "PDFThumbnailView",
+    "PDFOutline",
+    "PDFPage",
+] }

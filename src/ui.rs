@@ -1,4 +1,53 @@
 use objc2::rc::Retained;
+use objc2::{define_class, msg_send, MainThreadOnly};
+use objc2_foundation::{NSObjectProtocol, NSPoint};
+
+// NSScrollView subclass that horizontally centers the document when it is
+// narrower than the visible area.
+//
+// `tile` is the designated AppKit hook for scroll-view layout: it is called
+// on every resize, magnification change, and content update.  After calling
+// super (which lays out scrollers and the clip view), we move the document
+// view's origin so it is always centered when the content is narrower than
+// the visible area.
+define_class!(
+    #[unsafe(super = NSScrollView)]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = ()]
+    #[name = "FoliumCenteringScrollView"]
+    pub struct CenteringScrollView;
+
+    unsafe impl NSObjectProtocol for CenteringScrollView {}
+
+    impl CenteringScrollView {
+        #[unsafe(method(tile))]
+        fn tile(&self) {
+            unsafe { let _: () = msg_send![super(self), tile]; };
+
+            let Some(doc) = self.documentView() else { return };
+            let vis_w  = self.contentSize().width;
+            let doc_w  = doc.frame().size.width;
+            let new_x  = if doc_w < vis_w {
+                ((vis_w - doc_w) / 2.0).floor()
+            } else {
+                0.0
+            };
+
+            // Only move the frame when it actually changed to avoid needless
+            // layout passes.
+            if (doc.frame().origin.x - new_x).abs() > 0.5 {
+                doc.setFrameOrigin(NSPoint { x: new_x, y: doc.frame().origin.y });
+            }
+        }
+    }
+);
+
+impl CenteringScrollView {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(());
+        unsafe { msg_send![super(this), init] }
+    }
+}
 
 /// Raw-pointer wrapper that is `Send`.
 /// Only dereference on the thread that owns the pointee (main thread for AppKit).
@@ -162,11 +211,12 @@ pub fn build_pdf_container(
     );
     root_vev.setState(NSVisualEffectState::Active);
 
-    let scroll = NSScrollView::new(mtm);
+    let scroll = CenteringScrollView::new(mtm);
     scroll.setHasHorizontalScroller(true);
     scroll.setHasVerticalScroller(true);
     scroll.setDrawsBackground(false);
-    root_vev.addSubview(&scroll);
+
+    root_vev.addSubview(&*scroll);
     pin_to_superview(&scroll, &root_vev);
 
     // NSImageScaling(2) == NSImageScaleNone
@@ -175,5 +225,6 @@ pub fn build_pdf_container(
     scroll.setDocumentView(Some(&*image_view));
 
     let root = unsafe { Retained::cast_unchecked::<NSView>(root_vev) };
+    let scroll = unsafe { Retained::cast_unchecked::<NSScrollView>(scroll) };
     (root, scroll, image_view)
 }

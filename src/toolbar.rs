@@ -19,7 +19,10 @@ use objc2_foundation::{
 use pdfium_render::prelude::*;
 
 use crate::pdf::{PdfStateData, RenderResult};
-use crate::pdfium::get_pdfium;
+
+const SCALE_MIN: f32 = 0.5;
+const SCALE_MAX: f32 = 20.0;
+use crate::pdfium::lock_pdfium;
 use crate::ui::{rgba_to_nsimage, SendPtr};
 
 #[derive(Debug)]
@@ -279,7 +282,7 @@ define_class!(
         fn zoom_in(&self, _: Option<&AnyObject>) {
             {
                 if let Some(s) = self.ivars().pdf_state.borrow_mut().as_mut() {
-                    s.scale *= 1.25;
+                    s.scale = (s.scale * 1.25).clamp(SCALE_MIN, SCALE_MAX);
                 }
             }
             self.render_current_page();
@@ -289,7 +292,7 @@ define_class!(
         fn zoom_out(&self, _: Option<&AnyObject>) {
             {
                 if let Some(s) = self.ivars().pdf_state.borrow_mut().as_mut() {
-                    s.scale /= 1.25;
+                    s.scale = (s.scale / 1.25).clamp(SCALE_MIN, SCALE_MAX);
                 }
             }
             self.render_current_page();
@@ -299,18 +302,44 @@ define_class!(
         fn handle_magnify(&self, recognizer: &NSMagnificationGestureRecognizer) {
             let state: NSGestureRecognizerState =
                 unsafe { msg_send![recognizer, state] };
-            if state != NSGestureRecognizerState::Ended {
-                return;
-            }
-            let mag = recognizer.magnification();
-            {
-                let mut borrow = self.ivars().pdf_state.borrow_mut();
-                if let Some(s) = borrow.as_mut() {
-                    s.scale = (s.scale * (1.0 + mag as f32)).clamp(0.1, 20.0);
+
+            // `recognizer.magnification()` is the cumulative factor since
+            // gesture start, so `desired` is computed the same way for both
+            // Changed and Ended.
+            let mag = recognizer.magnification() as f32;
+            let start_scale = self.ivars().pdf_state.borrow()
+                .as_ref().map(|s| s.scale).unwrap_or(2.0);
+            let desired = (start_scale * (1.0 + mag)).clamp(SCALE_MIN, SCALE_MAX);
+
+            match state {
+                NSGestureRecognizerState::Changed => {
+                    // Live visual feedback on every gesture tick.
+                    // Scale the current bitmap centered on the pinch midpoint;
+                    // no re-render until the gesture ends.
+                    let last = self.ivars().last_rendered_scale.get();
+                    if last > 0.0 {
+                        if let Some(sv) = self.ivars().scroll_view.get() {
+                            let center = recognizer.locationInView(Some(sv));
+                            sv.setMagnification_centeredAtPoint(
+                                (desired / last) as f64,
+                                center,
+                            );
+                        }
+                    }
                 }
+                NSGestureRecognizerState::Ended => {
+                    {
+                        let mut borrow = self.ivars().pdf_state.borrow_mut();
+                        if let Some(s) = borrow.as_mut() {
+                            s.scale = desired;
+                        }
+                    }
+                    // render_current_page applies the interim magnification and
+                    // kicks off the background re-render.
+                    self.render_current_page();
+                }
+                _ => {}
             }
-            // No setMagnification(1.0) here — render callback handles it.
-            self.render_current_page();
         }
     }
 );
@@ -359,7 +388,8 @@ impl ToolbarHandler {
         let path_str = path.to_string();
         let bytes = std::fs::read(&path_str).expect("failed to read PDF");
         let page_count = {
-            let doc = get_pdfium()
+            let guard = lock_pdfium();
+            let doc = guard
                 .load_pdf_from_byte_slice(&bytes, None)
                 .expect("pdfium: failed to parse PDF");
             doc.pages().len() as usize
@@ -414,34 +444,47 @@ impl ToolbarHandler {
         let self_ptr = SendPtr::new(self as *const ToolbarHandler);
 
         std::thread::spawn(move || {
-            // --- Pdfium work on background thread ---
-            let doc = get_pdfium()
-                .load_pdf_from_byte_slice(&bytes_arc, None)
-                .expect("pdfium: re-open failed");
-            let page_ref = doc.pages().get(page as u16).expect("bad page index");
+            // Bail early if already superseded before even trying to acquire the lock.
+            if gen_arc.load(Ordering::SeqCst) != render_id { return; }
 
-            let pt_w = page_ref.width().value * scale;
-            let pt_h = page_ref.height().value * scale;
-            let px_w = (pt_w * backing_scale) as i32;
-            let px_h = (pt_h * backing_scale) as i32;
+            // --- Pdfium work: serialised through a global mutex ---
+            // pdfium is not thread-safe; the Mutex ensures only one render
+            // runs at a time.  All pdfium values (doc, page, bitmap) are
+            // scoped inside the block so they drop before the lock is released.
+            let result = {
+                let guard = lock_pdfium();
 
-            let bitmap = page_ref
-                .render_with_config(&PdfRenderConfig::new().set_target_size(px_w, px_h))
-                .expect("pdfium render failed");
+                // Check again: a newer request may have arrived while we waited.
+                if gen_arc.load(Ordering::SeqCst) != render_id { return; }
 
-            let img = bitmap.as_image();
-            let rgba = img.to_rgba8().into_raw();
-            let result = RenderResult {
-                rgba,
-                px_w: img.width() as usize,
-                px_h: img.height() as usize,
-                pt_w: pt_w as f64,
-                pt_h: pt_h as f64,
-                scale,
-                page,
-                page_count,
+                let doc = guard
+                    .load_pdf_from_byte_slice(&bytes_arc, None)
+                    .expect("pdfium: re-open failed");
+                let page_ref = doc.pages().get(page as u16).expect("bad page index");
+
+                let pt_w = page_ref.width().value * scale;
+                let pt_h = page_ref.height().value * scale;
+                let px_w = (pt_w * backing_scale) as i32;
+                let px_h = (pt_h * backing_scale) as i32;
+
+                let bitmap = page_ref
+                    .render_with_config(&PdfRenderConfig::new().set_target_size(px_w, px_h))
+                    .expect("pdfium render failed");
+
+                let img = bitmap.as_image();
+                let rgba = img.to_rgba8().into_raw();
+                RenderResult {
+                    rgba,
+                    px_w: img.width() as usize,
+                    px_h: img.height() as usize,
+                    pt_w: pt_w as f64,
+                    pt_h: pt_h as f64,
+                    scale,
+                    page,
+                    page_count,
+                }
+                // guard, bitmap, page_ref, doc all dropped here — lock released
             };
-            // doc, page_ref, bitmap dropped here — pdfium resources freed
 
             // Pre-flight cancellation check before touching the main queue.
             if gen_arc.load(Ordering::SeqCst) != render_id { return; }
@@ -492,6 +535,9 @@ impl ToolbarHandler {
                 let content_view = scroll_view.contentView();
                 content_view.scrollToPoint(new_origin);
                 scroll_view.reflectScrolledClipView(&content_view);
+                // Trigger tile so the CenteringScrollView re-centers the document
+                // immediately if it is narrower than the visible area.
+                unsafe { let _: () = msg_send![scroll_view, tile]; };
 
                 // Record the scale this bitmap was rendered at.
                 let handler = unsafe { &*self_ptr.as_ptr() };

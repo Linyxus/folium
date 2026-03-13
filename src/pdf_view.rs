@@ -4,9 +4,10 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSAlert, NSBackingStoreType, NSBezelStyle, NSButton, NSColor, NSEvent, NSImage, NSMenu,
-    NSMenuItem, NSPanel, NSScrollView, NSTextField, NSTextView, NSTrackingArea,
-    NSTrackingAreaOptions, NSWindowStyleMask,
+    NSBackingStoreType, NSButton, NSColor, NSEvent, NSFont, NSImage, NSPanel, NSScrollView,
+    NSTextField, NSTextView, NSTrackingArea, NSTrackingAreaOptions, NSVisualEffectBlendingMode,
+    NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindowStyleMask,
+    NSWindowTitleVisibility,
 };
 use objc2_foundation::{
     ns_string, MainThreadMarker, NSNotification, NSNotificationCenter, NSObjectProtocol, NSPoint,
@@ -24,10 +25,15 @@ pub struct FoliumPDFViewIvars {
     current_tooltip: RefCell<Option<Retained<NSString>>>,
     tooltip_panel: OnceCell<Retained<NSPanel>>,
     tooltip_label: OnceCell<Retained<NSTextField>>,
-    // Selection action panel
+    // Selection action panel (highlight pill)
     action_panel: OnceCell<Retained<NSPanel>>,
-    action_btn: OnceCell<Retained<NSButton>>,
     selection_observer_registered: OnceCell<()>,
+    // Annotation action bar (delete / colors / note)
+    annotation_bar: OnceCell<Retained<NSPanel>>,
+    // Note editor
+    note_panel: OnceCell<Retained<NSPanel>>,
+    note_text_view: OnceCell<Retained<NSTextView>>,
+    note_annotation: RefCell<Option<Retained<PDFAnnotation>>>,
 }
 
 define_class!(
@@ -41,31 +47,50 @@ define_class!(
     unsafe impl NSObjectProtocol for FoliumPDFView {}
 
     impl FoliumPDFView {
-        // ── Context menu ─────────────────────────────────────────
+        // ── Mouse handling ───────────────────────────────────────
 
-        #[unsafe(method_id(menuForEvent:))]
-        fn menu_for_event(&self, event: &NSEvent) -> Option<Retained<NSMenu>> {
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, event: &NSEvent) {
+            self.hide_annotation_bar();
+            unsafe { msg_send![super(self), mouseDown: event] }
+        }
+
+        #[unsafe(method(mouseUp:))]
+        fn mouse_up(&self, event: &NSEvent) {
+            unsafe { msg_send![super(self), mouseUp: event] }
+
+            if event.clickCount() != 1 { return; }
+            if unsafe { self.currentSelection() }.is_some() { return; }
+
             let win_point = event.locationInWindow();
             let view_point = self.convertPoint_fromView(win_point, None);
             let Some(page) = (unsafe { self.pageForPoint_nearest(view_point, false) }) else {
-                return unsafe { msg_send![super(self), menuForEvent: event] };
+                return;
             };
             let page_point = unsafe { self.convertPoint_toPage(view_point, &page) };
             let Some(annotation) = (unsafe { page.annotationAtPoint(page_point) }) else {
-                return unsafe { msg_send![super(self), menuForEvent: event] };
+                return;
             };
-            *self.ivars().active_annotation.borrow_mut() = Some(annotation);
-            let mtm = MainThreadMarker::from(self);
-            Some(self.build_annotation_menu(mtm))
+
+            *self.ivars().active_annotation.borrow_mut() = Some(annotation.clone());
+            let page_rect = unsafe { annotation.bounds() };
+            let view_rect = unsafe { self.convertRect_fromPage(page_rect, &page) };
+            self.show_annotation_bar(view_rect);
         }
+
+        // ── Annotation actions ───────────────────────────────────
 
         #[unsafe(method(deleteAnnotation:))]
         fn delete_annotation(&self, _sender: Option<&AnyObject>) {
-            let ann = self.ivars().active_annotation.borrow();
-            let Some(ref a) = *ann else { return };
-            if let Some(page) = unsafe { a.page() } {
-                unsafe { page.removeAnnotation(a) };
+            {
+                let ann = self.ivars().active_annotation.borrow();
+                let Some(ref a) = *ann else { return };
+                if let Some(page) = unsafe { a.page() } {
+                    unsafe { page.removeAnnotation(a) };
+                }
             }
+            self.hide_annotation_bar();
+            *self.ivars().active_annotation.borrow_mut() = None;
         }
 
         #[unsafe(method(addAnnotationNote:))]
@@ -77,7 +102,8 @@ define_class!(
                     None => return,
                 }
             };
-            self.show_note_dialog(&annotation);
+            self.hide_annotation_bar();
+            self.show_note_editor(annotation);
         }
 
         #[unsafe(method(setAnnotationColorYellow:))]
@@ -105,7 +131,7 @@ define_class!(
             self.set_active_annotation_color(&NSColor::redColor());
         }
 
-        // ── Highlight action ─────────────────────────────────────
+        // ── Highlight actions ────────────────────────────────────
 
         #[unsafe(method(highlightSelection:))]
         fn highlight_selection(&self, _sender: Option<&AnyObject>) {
@@ -131,6 +157,61 @@ define_class!(
             unsafe { self.clearSelection() };
         }
 
+        #[unsafe(method(highlightAndAddNote:))]
+        fn highlight_and_add_note(&self, _sender: Option<&AnyObject>) {
+            let selection = unsafe { self.currentSelection() };
+            let Some(selection) = selection else { return };
+
+            let color = NSColor::yellowColor();
+            let pages = unsafe { selection.pages() };
+            let mut first_annotation: Option<Retained<PDFAnnotation>> = None;
+            for i in 0..pages.count() {
+                let page = pages.objectAtIndex(i);
+                let bounds = unsafe { selection.boundsForPage(&page) };
+                let annotation = unsafe {
+                    PDFAnnotation::initWithBounds_forType_withProperties(
+                        PDFAnnotation::alloc(),
+                        bounds,
+                        &PDFAnnotationSubtypeHighlight,
+                        None,
+                    )
+                };
+                unsafe { annotation.setColor(&color) };
+                unsafe { page.addAnnotation(&annotation) };
+                if first_annotation.is_none() {
+                    first_annotation = Some(annotation);
+                }
+            }
+            unsafe { self.clearSelection() };
+
+            if let Some(annotation) = first_annotation {
+                self.show_note_editor(annotation);
+            }
+        }
+
+        // ── Note editor actions ──────────────────────────────────
+
+        #[unsafe(method(saveNote:))]
+        fn save_note(&self, _sender: Option<&AnyObject>) {
+            if let Some(text_view) = self.ivars().note_text_view.get() {
+                let note = text_view.string();
+                let ann = self.ivars().note_annotation.borrow();
+                if let Some(ref a) = *ann {
+                    if note.length() > 0 {
+                        unsafe { a.setContents(Some(&note)) };
+                    } else {
+                        unsafe { a.setContents(None) };
+                    }
+                }
+            }
+            self.hide_note_editor();
+        }
+
+        #[unsafe(method(cancelNote:))]
+        fn cancel_note(&self, _sender: Option<&AnyObject>) {
+            self.hide_note_editor();
+        }
+
         // ── Selection change notification ────────────────────────
 
         #[unsafe(method(selectionDidChange:))]
@@ -143,7 +224,6 @@ define_class!(
                         self.hide_action_panel();
                         return;
                     }
-                    // Use the first page's selection bounds to position the panel.
                     let page = pages.objectAtIndex(0);
                     let page_rect = unsafe { sel.boundsForPage(&page) };
                     if page_rect.size.width < 1.0 {
@@ -162,7 +242,6 @@ define_class!(
         #[unsafe(method(updateTrackingAreas))]
         fn update_tracking_areas(&self) {
             unsafe { msg_send![super(self), updateTrackingAreas] }
-            // Register selection observer once.
             if self.ivars().selection_observer_registered.get().is_none() {
                 self.register_selection_observer();
                 let _ = self.ivars().selection_observer_registered.set(());
@@ -251,30 +330,299 @@ impl FoliumPDFView {
         }
     }
 
-    // ── Selection action panel ───────────────────────────────────
+    // ── Annotation action bar ────────────────────────────────────
+
+    fn ensure_annotation_bar(&self) {
+        if self.ivars().annotation_bar.get().is_some() {
+            return;
+        }
+        let mtm = MainThreadMarker::from(self);
+        let target = self as *const FoliumPDFView as *const AnyObject;
+        let pill_h: f64 = 36.0;
+
+        // Helper — icon button (delete / note).
+        let make_icon_btn =
+            |symbol: &NSString, label: &NSString, action: objc2::runtime::Sel| -> Retained<NSButton> {
+                let btn = unsafe {
+                    NSButton::buttonWithTitle_target_action(
+                        ns_string!(""),
+                        Some(&*target),
+                        Some(action),
+                        mtm,
+                    )
+                };
+                if let Some(img) =
+                    NSImage::imageWithSystemSymbolName_accessibilityDescription(symbol, Some(label))
+                {
+                    btn.setImage(Some(&img));
+                }
+                btn.setBordered(false);
+                btn.setTranslatesAutoresizingMaskIntoConstraints(false);
+                btn
+            };
+
+        // Helper — color dot button.
+        let make_color_btn =
+            |color: &NSColor, action: objc2::runtime::Sel| -> Retained<NSButton> {
+                let btn = unsafe {
+                    NSButton::buttonWithTitle_target_action(
+                        ns_string!(""),
+                        Some(&*target),
+                        Some(action),
+                        mtm,
+                    )
+                };
+                if let Some(img) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                    ns_string!("circle.fill"),
+                    None,
+                ) {
+                    btn.setImage(Some(&img));
+                }
+                unsafe {
+                    let _: () = msg_send![&*btn, setContentTintColor: color];
+                }
+                btn.setBordered(false);
+                btn.setTranslatesAutoresizingMaskIntoConstraints(false);
+                btn
+            };
+
+        let btn_delete = make_icon_btn(
+            ns_string!("trash"),
+            ns_string!("Delete"),
+            sel!(deleteAnnotation:),
+        );
+
+        let colors: [(_, objc2::runtime::Sel); 5] = [
+            (NSColor::yellowColor(),     sel!(setAnnotationColorYellow:)),
+            (NSColor::greenColor(),      sel!(setAnnotationColorGreen:)),
+            (NSColor::blueColor(),       sel!(setAnnotationColorBlue:)),
+            (NSColor::systemPinkColor(), sel!(setAnnotationColorPink:)),
+            (NSColor::redColor(),        sel!(setAnnotationColorRed:)),
+        ];
+        let color_btns: Vec<Retained<NSButton>> = colors
+            .iter()
+            .map(|(c, a)| make_color_btn(c, *a))
+            .collect();
+
+        let btn_note = make_icon_btn(
+            ns_string!("note.text"),
+            ns_string!("Add Note"),
+            sel!(addAnnotationNote:),
+        );
+
+        // Frosted-glass pill.
+        let vev = NSVisualEffectView::new(mtm);
+        vev.setMaterial(NSVisualEffectMaterial::Popover);
+        vev.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
+        vev.setState(NSVisualEffectState::Active);
+        vev.setWantsLayer(true);
+        vev.addSubview(&btn_delete);
+        for b in &color_btns {
+            vev.addSubview(b);
+        }
+        vev.addSubview(&btn_note);
+        unsafe {
+            let layer: Option<&AnyObject> = msg_send![&*vev, layer];
+            if let Some(layer) = layer {
+                let _: () = msg_send![layer, setCornerRadius: pill_h / 2.0];
+                let _: () = msg_send![layer, setMasksToBounds: true];
+            }
+        }
+
+        // Layout — horizontal chain: delete | colors… | note
+        let icon_sz = 22.0;
+        let dot_sz = 18.0;
+        let pad = 10.0;
+        let gap = 6.0; // between groups
+        let dot_gap = 4.0; // between color dots
+        let vev_view: &objc2_app_kit::NSView = &vev;
+
+        // Collect all constraints.
+        let mut constraints = vec![
+            // Delete — left edge
+            btn_delete
+                .leadingAnchor()
+                .constraintEqualToAnchor_constant(&vev_view.leadingAnchor(), pad),
+            btn_delete
+                .centerYAnchor()
+                .constraintEqualToAnchor(&vev_view.centerYAnchor()),
+            btn_delete.widthAnchor().constraintEqualToConstant(icon_sz),
+            btn_delete.heightAnchor().constraintEqualToConstant(icon_sz),
+        ];
+
+        // Color dots chained after delete.
+        let mut prev_trailing = btn_delete.trailingAnchor();
+        let mut first_color = true;
+        for b in &color_btns {
+            let spacing = if first_color { gap } else { dot_gap };
+            first_color = false;
+            constraints.push(
+                b.leadingAnchor()
+                    .constraintEqualToAnchor_constant(&prev_trailing, spacing),
+            );
+            constraints.push(
+                b.centerYAnchor()
+                    .constraintEqualToAnchor(&vev_view.centerYAnchor()),
+            );
+            constraints.push(b.widthAnchor().constraintEqualToConstant(dot_sz));
+            constraints.push(b.heightAnchor().constraintEqualToConstant(dot_sz));
+            prev_trailing = b.trailingAnchor();
+        }
+
+        // Note — right edge, chained after last color.
+        constraints.push(
+            btn_note
+                .leadingAnchor()
+                .constraintEqualToAnchor_constant(&prev_trailing, gap),
+        );
+        constraints.push(
+            btn_note
+                .trailingAnchor()
+                .constraintEqualToAnchor_constant(&vev_view.trailingAnchor(), -pad),
+        );
+        constraints.push(
+            btn_note
+                .centerYAnchor()
+                .constraintEqualToAnchor(&vev_view.centerYAnchor()),
+        );
+        constraints.push(btn_note.widthAnchor().constraintEqualToConstant(icon_sz));
+        constraints.push(btn_note.heightAnchor().constraintEqualToConstant(icon_sz));
+
+        objc2_app_kit::NSLayoutConstraint::activateConstraints(
+            &objc2_foundation::NSArray::from_retained_slice(&constraints),
+        );
+
+        // Transparent panel.
+        let panel: Retained<NSPanel> = unsafe {
+            msg_send![
+                NSPanel::alloc(mtm),
+                initWithContentRect: NSRect::ZERO,
+                styleMask: NSWindowStyleMask::empty(),
+                backing: NSBackingStoreType::Buffered,
+                defer: true
+            ]
+        };
+        panel.setLevel(3);
+        panel.setHasShadow(true);
+        panel.setOpaque(false);
+        panel.setBackgroundColor(Some(&NSColor::clearColor()));
+        unsafe { panel.setReleasedWhenClosed(false) };
+        panel.setContentView(Some(&vev));
+
+        let _ = self.ivars().annotation_bar.set(panel);
+    }
+
+    fn show_annotation_bar(&self, annotation_view_rect: NSRect) {
+        self.ensure_annotation_bar();
+        let panel = self.ivars().annotation_bar.get().unwrap();
+
+        // pill: 10 + 22 + 6 + (18*5 + 4*4) + 6 + 22 + 10 = 182
+        let pill_w = 182.0;
+        let pill_h = 36.0;
+        let Some(window) = self.window() else { return };
+
+        let top_center = NSPoint::new(
+            annotation_view_rect.origin.x + annotation_view_rect.size.width / 2.0,
+            annotation_view_rect.origin.y + annotation_view_rect.size.height,
+        );
+        let win_point = self.convertPoint_toView(top_center, None);
+        let screen_point = window.convertPointToScreen(win_point);
+        let origin = NSPoint::new(
+            screen_point.x - pill_w / 2.0,
+            screen_point.y + 6.0,
+        );
+        panel.setFrame_display(NSRect::new(origin, NSSize::new(pill_w, pill_h)), true);
+        panel.orderFront(None);
+    }
+
+    fn hide_annotation_bar(&self) {
+        if let Some(panel) = self.ivars().annotation_bar.get() {
+            panel.orderOut(None);
+        }
+    }
+
+    // ── Selection action panel (highlight pill) ──────────────────
 
     fn ensure_action_panel(&self) {
         if self.ivars().action_panel.get().is_some() {
             return;
         }
         let mtm = MainThreadMarker::from(self);
-
         let target = self as *const FoliumPDFView as *const AnyObject;
-        let btn = unsafe {
-            NSButton::buttonWithTitle_target_action(
-                ns_string!(""),
-                Some(&*target),
-                Some(sel!(highlightSelection:)),
-                mtm,
-            )
-        };
-        if let Some(img) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+
+        let make_icon_btn =
+            |symbol: &NSString, label: &NSString, action: objc2::runtime::Sel| -> Retained<NSButton> {
+                let btn = unsafe {
+                    NSButton::buttonWithTitle_target_action(
+                        ns_string!(""),
+                        Some(&*target),
+                        Some(action),
+                        mtm,
+                    )
+                };
+                if let Some(img) =
+                    NSImage::imageWithSystemSymbolName_accessibilityDescription(symbol, Some(label))
+                {
+                    btn.setImage(Some(&img));
+                }
+                btn.setBordered(false);
+                btn.setTranslatesAutoresizingMaskIntoConstraints(false);
+                btn
+            };
+
+        let btn_highlight = make_icon_btn(
             ns_string!("highlighter"),
-            Some(ns_string!("Highlight")),
-        ) {
-            btn.setImage(Some(&img));
+            ns_string!("Highlight"),
+            sel!(highlightSelection:),
+        );
+        let btn_note = make_icon_btn(
+            ns_string!("note.text"),
+            ns_string!("Highlight & Add Note"),
+            sel!(highlightAndAddNote:),
+        );
+
+        let pill_h: f64 = 36.0;
+        let vev = NSVisualEffectView::new(mtm);
+        vev.setMaterial(NSVisualEffectMaterial::Popover);
+        vev.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
+        vev.setState(NSVisualEffectState::Active);
+        vev.setWantsLayer(true);
+        vev.addSubview(&btn_highlight);
+        vev.addSubview(&btn_note);
+        unsafe {
+            let layer: Option<&AnyObject> = msg_send![&*vev, layer];
+            if let Some(layer) = layer {
+                let _: () = msg_send![layer, setCornerRadius: pill_h / 2.0];
+                let _: () = msg_send![layer, setMasksToBounds: true];
+            }
         }
-        btn.setBezelStyle(NSBezelStyle::Glass);
+
+        let icon_size = 24.0;
+        let h_pad = 8.0;
+        let vev_view: &objc2_app_kit::NSView = &vev;
+        objc2_app_kit::NSLayoutConstraint::activateConstraints(
+            &objc2_foundation::NSArray::from_retained_slice(&[
+                btn_highlight
+                    .leadingAnchor()
+                    .constraintEqualToAnchor_constant(&vev_view.leadingAnchor(), h_pad),
+                btn_highlight
+                    .centerYAnchor()
+                    .constraintEqualToAnchor(&vev_view.centerYAnchor()),
+                btn_highlight.widthAnchor().constraintEqualToConstant(icon_size),
+                btn_highlight.heightAnchor().constraintEqualToConstant(icon_size),
+                btn_note
+                    .leadingAnchor()
+                    .constraintEqualToAnchor_constant(&btn_highlight.trailingAnchor(), h_pad),
+                btn_note
+                    .trailingAnchor()
+                    .constraintEqualToAnchor_constant(&vev_view.trailingAnchor(), -h_pad),
+                btn_note
+                    .centerYAnchor()
+                    .constraintEqualToAnchor(&vev_view.centerYAnchor()),
+                btn_note.widthAnchor().constraintEqualToConstant(icon_size),
+                btn_note.heightAnchor().constraintEqualToConstant(icon_size),
+            ]),
+        );
 
         let panel: Retained<NSPanel> = unsafe {
             msg_send![
@@ -285,12 +633,13 @@ impl FoliumPDFView {
                 defer: true
             ]
         };
-        panel.setLevel(3); // NSFloatingWindowLevel
+        panel.setLevel(3);
         panel.setHasShadow(true);
+        panel.setOpaque(false);
+        panel.setBackgroundColor(Some(&NSColor::clearColor()));
         unsafe { panel.setReleasedWhenClosed(false) };
-        panel.setContentView(Some(&btn));
+        panel.setContentView(Some(&vev));
 
-        let _ = self.ivars().action_btn.set(btn);
         let _ = self.ivars().action_panel.set(panel);
     }
 
@@ -298,10 +647,10 @@ impl FoliumPDFView {
         self.ensure_action_panel();
         let panel = self.ivars().action_panel.get().unwrap();
 
-        let btn_size = 36.0;
+        let pill_w = 72.0;
+        let pill_h = 36.0;
         let Some(window) = self.window() else { return };
 
-        // Position the panel centered above the selection.
         let top_center = NSPoint::new(
             selection_view_rect.origin.x + selection_view_rect.size.width / 2.0,
             selection_view_rect.origin.y + selection_view_rect.size.height,
@@ -309,11 +658,10 @@ impl FoliumPDFView {
         let win_point = self.convertPoint_toView(top_center, None);
         let screen_point = window.convertPointToScreen(win_point);
         let origin = NSPoint::new(
-            screen_point.x - btn_size / 2.0,
+            screen_point.x - pill_w / 2.0,
             screen_point.y + 6.0,
         );
-        let frame = NSRect::new(origin, NSSize::new(btn_size, btn_size));
-        panel.setFrame_display(frame, true);
+        panel.setFrame_display(NSRect::new(origin, NSSize::new(pill_w, pill_h)), true);
         panel.orderFront(None);
     }
 
@@ -321,6 +669,186 @@ impl FoliumPDFView {
         if let Some(panel) = self.ivars().action_panel.get() {
             panel.orderOut(None);
         }
+    }
+
+    // ── Note editor ──────────────────────────────────────────────
+
+    fn ensure_note_panel(&self) {
+        if self.ivars().note_panel.get().is_some() {
+            return;
+        }
+        let mtm = MainThreadMarker::from(self);
+        let target = self as *const FoliumPDFView as *const AnyObject;
+        let panel_w = 280.0_f64;
+        let panel_h = 120.0_f64;
+
+        let tv_frame = NSRect::new(NSPoint::ZERO, NSSize::new(panel_w, panel_h));
+        let text_view: Retained<NSTextView> = unsafe {
+            objc2::msg_send![NSTextView::alloc(mtm), initWithFrame: tv_frame]
+        };
+        text_view.setRichText(false);
+        text_view.setDrawsBackground(false);
+        text_view.setTextColor(Some(&NSColor::labelColor()));
+        text_view.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+        text_view.setTranslatesAutoresizingMaskIntoConstraints(false);
+
+        let scroll_view = NSScrollView::new(mtm);
+        scroll_view.setHasVerticalScroller(true);
+        scroll_view.setDrawsBackground(false);
+        scroll_view.setTranslatesAutoresizingMaskIntoConstraints(false);
+        scroll_view.setDocumentView(Some(&text_view));
+
+        let save_btn = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                ns_string!(""),
+                Some(&*target),
+                Some(sel!(saveNote:)),
+                mtm,
+            )
+        };
+        if let Some(img) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+            ns_string!("checkmark.circle.fill"),
+            Some(ns_string!("Save")),
+        ) {
+            save_btn.setImage(Some(&img));
+        }
+        save_btn.setBordered(false);
+        save_btn.setTranslatesAutoresizingMaskIntoConstraints(false);
+
+        let cancel_btn = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                ns_string!(""),
+                Some(&*target),
+                Some(sel!(cancelNote:)),
+                mtm,
+            )
+        };
+        if let Some(img) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+            ns_string!("xmark.circle"),
+            Some(ns_string!("Cancel")),
+        ) {
+            cancel_btn.setImage(Some(&img));
+        }
+        cancel_btn.setBordered(false);
+        cancel_btn.setTranslatesAutoresizingMaskIntoConstraints(false);
+
+        let vev = NSVisualEffectView::new(mtm);
+        vev.setMaterial(NSVisualEffectMaterial::Popover);
+        vev.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
+        vev.setState(NSVisualEffectState::Active);
+        vev.setWantsLayer(true);
+        vev.addSubview(&scroll_view);
+        vev.addSubview(&save_btn);
+        vev.addSubview(&cancel_btn);
+        unsafe {
+            let layer: Option<&AnyObject> = msg_send![&*vev, layer];
+            if let Some(layer) = layer {
+                let _: () = msg_send![layer, setCornerRadius: 12.0_f64];
+                let _: () = msg_send![layer, setMasksToBounds: true];
+            }
+        }
+
+        let pad = 12.0;
+        let btn_sz = 20.0;
+        let vev_view: &objc2_app_kit::NSView = &vev;
+        objc2_app_kit::NSLayoutConstraint::activateConstraints(
+            &objc2_foundation::NSArray::from_retained_slice(&[
+                scroll_view
+                    .topAnchor()
+                    .constraintEqualToAnchor_constant(&vev_view.topAnchor(), pad),
+                scroll_view
+                    .leadingAnchor()
+                    .constraintEqualToAnchor_constant(&vev_view.leadingAnchor(), pad),
+                scroll_view
+                    .trailingAnchor()
+                    .constraintEqualToAnchor_constant(&vev_view.trailingAnchor(), -pad),
+                save_btn
+                    .topAnchor()
+                    .constraintEqualToAnchor_constant(&scroll_view.bottomAnchor(), 6.0),
+                save_btn
+                    .bottomAnchor()
+                    .constraintEqualToAnchor_constant(&vev_view.bottomAnchor(), -8.0),
+                save_btn
+                    .trailingAnchor()
+                    .constraintEqualToAnchor_constant(&vev_view.trailingAnchor(), -pad),
+                save_btn.widthAnchor().constraintEqualToConstant(btn_sz),
+                save_btn.heightAnchor().constraintEqualToConstant(btn_sz),
+                cancel_btn
+                    .centerYAnchor()
+                    .constraintEqualToAnchor(&save_btn.centerYAnchor()),
+                cancel_btn
+                    .trailingAnchor()
+                    .constraintEqualToAnchor_constant(&save_btn.leadingAnchor(), -6.0),
+                cancel_btn.widthAnchor().constraintEqualToConstant(btn_sz),
+                cancel_btn.heightAnchor().constraintEqualToConstant(btn_sz),
+            ]),
+        );
+
+        let style = NSWindowStyleMask::Titled | NSWindowStyleMask::FullSizeContentView;
+        let panel: Retained<NSPanel> = unsafe {
+            msg_send![
+                NSPanel::alloc(mtm),
+                initWithContentRect: NSRect::new(NSPoint::ZERO, NSSize::new(panel_w, panel_h)),
+                styleMask: style,
+                backing: NSBackingStoreType::Buffered,
+                defer: true
+            ]
+        };
+        panel.setLevel(3);
+        panel.setHasShadow(true);
+        panel.setOpaque(false);
+        panel.setBackgroundColor(Some(&NSColor::clearColor()));
+        panel.setTitlebarAppearsTransparent(true);
+        panel.setTitleVisibility(NSWindowTitleVisibility::Hidden);
+        panel.setMovable(true);
+        unsafe { panel.setReleasedWhenClosed(false) };
+        panel.setContentView(Some(&vev));
+
+        let _ = self.ivars().note_text_view.set(text_view);
+        let _ = self.ivars().note_panel.set(panel);
+    }
+
+    fn show_note_editor(&self, annotation: Retained<PDFAnnotation>) {
+        self.ensure_note_panel();
+        let panel = self.ivars().note_panel.get().unwrap();
+        let text_view = self.ivars().note_text_view.get().unwrap();
+
+        if let Some(existing) = unsafe { annotation.contents() } {
+            text_view.setString(&existing);
+        } else {
+            text_view.setString(ns_string!(""));
+        }
+
+        let panel_w = 280.0;
+        let panel_h = 120.0;
+        if let Some(page) = unsafe { annotation.page() } {
+            let page_rect = unsafe { annotation.bounds() };
+            let view_rect = unsafe { self.convertRect_fromPage(page_rect, &page) };
+            if let Some(window) = self.window() {
+                let top_left = NSPoint::new(
+                    view_rect.origin.x,
+                    view_rect.origin.y + view_rect.size.height,
+                );
+                let win_point = self.convertPoint_toView(top_left, None);
+                let screen_point = window.convertPointToScreen(win_point);
+                let origin = NSPoint::new(screen_point.x, screen_point.y + 6.0);
+                panel.setFrame_display(
+                    NSRect::new(origin, NSSize::new(panel_w, panel_h)),
+                    true,
+                );
+            }
+        }
+
+        *self.ivars().note_annotation.borrow_mut() = Some(annotation);
+        panel.makeKeyAndOrderFront(None);
+        panel.makeFirstResponder(Some(text_view));
+    }
+
+    fn hide_note_editor(&self) {
+        if let Some(panel) = self.ivars().note_panel.get() {
+            panel.orderOut(None);
+        }
+        *self.ivars().note_annotation.borrow_mut() = None;
     }
 
     // ── Tooltip panel ────────────────────────────────────────────
@@ -335,7 +863,24 @@ impl FoliumPDFView {
         label.setEditable(false);
         label.setSelectable(false);
         label.setBezeled(false);
-        label.setDrawsBackground(true);
+        label.setDrawsBackground(false);
+        label.setTextColor(Some(&NSColor::labelColor()));
+        label.setFont(Some(&NSFont::systemFontOfSize(NSFont::smallSystemFontSize())));
+
+        let vev = NSVisualEffectView::new(mtm);
+        vev.setMaterial(NSVisualEffectMaterial::Popover);
+        vev.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
+        vev.setState(NSVisualEffectState::Active);
+        vev.addSubview(&label);
+
+        vev.setWantsLayer(true);
+        unsafe {
+            let layer: Option<&AnyObject> = msg_send![&*vev, layer];
+            if let Some(layer) = layer {
+                let _: () = msg_send![layer, setCornerRadius: 8.0_f64];
+                let _: () = msg_send![layer, setMasksToBounds: true];
+            }
+        }
 
         let panel: Retained<NSPanel> = unsafe {
             msg_send![
@@ -349,8 +894,10 @@ impl FoliumPDFView {
         panel.setLevel(3);
         panel.setIgnoresMouseEvents(true);
         panel.setHasShadow(true);
+        panel.setOpaque(false);
+        panel.setBackgroundColor(Some(&NSColor::clearColor()));
         unsafe { panel.setReleasedWhenClosed(false) };
-        panel.setContentView(Some(&label));
+        panel.setContentView(Some(&vev));
 
         let _ = self.ivars().tooltip_label.set(label);
         let _ = self.ivars().tooltip_panel.set(panel);
@@ -364,9 +911,10 @@ impl FoliumPDFView {
         label.setStringValue(text);
         label.sizeToFit();
         let label_size = label.frame().size;
-        let padding = 6.0;
-        let size = NSSize::new(label_size.width + padding * 2.0, label_size.height + padding * 2.0);
-        label.setFrame(NSRect::new(NSPoint::new(padding, padding), label_size));
+        let h_pad = 12.0;
+        let v_pad = 8.0;
+        let size = NSSize::new(label_size.width + h_pad * 2.0, label_size.height + v_pad * 2.0);
+        label.setFrame(NSRect::new(NSPoint::new(h_pad, v_pad), label_size));
 
         if let Some(window) = self.window() {
             let screen_point = window.convertPointToScreen(event.locationInWindow());
@@ -382,50 +930,6 @@ impl FoliumPDFView {
         }
     }
 
-    // ── Note dialog ──────────────────────────────────────────────
-
-    fn show_note_dialog(&self, annotation: &PDFAnnotation) {
-        let mtm = MainThreadMarker::from(self);
-        let has_note = unsafe { annotation.contents() }
-            .map(|s| s.length() > 0)
-            .unwrap_or(false);
-
-        let alert = NSAlert::new(mtm);
-        alert.setMessageText(if has_note {
-            ns_string!("Edit Note")
-        } else {
-            ns_string!("Add Note")
-        });
-        alert.addButtonWithTitle(ns_string!("Save"));
-        alert.addButtonWithTitle(ns_string!("Cancel"));
-
-        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(300.0, 100.0));
-        let scroll_view = NSScrollView::new(mtm);
-        scroll_view.setFrame(frame);
-        scroll_view.setHasVerticalScroller(true);
-
-        let text_view: Retained<NSTextView> = unsafe {
-            objc2::msg_send![NSTextView::alloc(mtm), initWithFrame: frame]
-        };
-        text_view.setRichText(false);
-        if let Some(existing) = unsafe { annotation.contents() } {
-            text_view.setString(&existing);
-        }
-
-        scroll_view.setDocumentView(Some(&text_view));
-        alert.setAccessoryView(Some(&scroll_view));
-
-        let response = alert.runModal();
-        if response == 1000 {
-            let note = text_view.string();
-            if note.length() > 0 {
-                unsafe { annotation.setContents(Some(&note)) };
-            } else {
-                unsafe { annotation.setContents(None) };
-            }
-        }
-    }
-
     // ── Annotation helpers ───────────────────────────────────────
 
     fn set_active_annotation_color(&self, color: &NSColor) {
@@ -433,67 +937,4 @@ impl FoliumPDFView {
         let Some(ref a) = *ann else { return };
         unsafe { a.setColor(color) };
     }
-
-    fn build_annotation_menu(&self, mtm: MainThreadMarker) -> Retained<NSMenu> {
-        let target = self as *const FoliumPDFView as *const AnyObject;
-        let menu = NSMenu::new(mtm);
-
-        let del = make_menu_item(mtm, "Delete Annotation", sel!(deleteAnnotation:), target);
-        menu.addItem(&del);
-
-        let has_note = {
-            let ann = self.ivars().active_annotation.borrow();
-            ann.as_ref()
-                .and_then(|a| unsafe { a.contents() })
-                .map(|s| s.length() > 0)
-                .unwrap_or(false)
-        };
-        let note_label = if has_note { "Edit Note\u{2026}" } else { "Add Note\u{2026}" };
-        let note = make_menu_item(mtm, note_label, sel!(addAnnotationNote:), target);
-        menu.addItem(&note);
-
-        menu.addItem(&NSMenuItem::separatorItem(mtm));
-
-        let color_item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                ns_string!("Change Color"),
-                None,
-                ns_string!(""),
-            )
-        };
-        let color_submenu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Change Color"));
-        for (label, action) in [
-            ("Yellow", sel!(setAnnotationColorYellow:)),
-            ("Green",  sel!(setAnnotationColorGreen:)),
-            ("Blue",   sel!(setAnnotationColorBlue:)),
-            ("Pink",   sel!(setAnnotationColorPink:)),
-            ("Red",    sel!(setAnnotationColorRed:)),
-        ] {
-            let item = make_menu_item(mtm, label, action, target);
-            color_submenu.addItem(&item);
-        }
-        color_item.setSubmenu(Some(&color_submenu));
-        menu.addItem(&color_item);
-
-        menu
-    }
-}
-
-fn make_menu_item(
-    mtm: MainThreadMarker,
-    title: &str,
-    action: objc2::runtime::Sel,
-    target: *const AnyObject,
-) -> Retained<NSMenuItem> {
-    let item = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            &NSString::from_str(title),
-            Some(action),
-            ns_string!(""),
-        )
-    };
-    unsafe { item.setTarget(Some(&*target)) };
-    item
 }

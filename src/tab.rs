@@ -56,18 +56,18 @@ impl TabController {
         let blank_view = build_blank_view(mtm, target);
         handler.set_blank_view(blank_view.clone());
 
-        // Build toolbar (not yet attached to window — attached on first PDF load)
+        // Build toolbar and attach it immediately so chrome height stays constant.
         let toolbar = NSToolbar::initWithIdentifier(
             NSToolbar::alloc(mtm),
             ns_string!("FoliumToolbar"),
         );
         toolbar.setDelegate(Some(ProtocolObject::from_ref(&*handler)));
-        handler.set_toolbar(toolbar);
+        window.setToolbar(Some(&*toolbar));
 
         // Wire window reference into handler
         handler.set_window(window.clone());
 
-        // Start in blank state: no toolbar, blank content view
+        // Start in blank state with blank content view
         window.setContentView(Some(&*blank_view));
 
         TabController { window, handler }

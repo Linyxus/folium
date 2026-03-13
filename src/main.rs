@@ -2,6 +2,7 @@
 #![allow(non_snake_case)]
 
 mod app;
+mod pdf_view;
 mod tab;
 mod toolbar;
 mod ui;

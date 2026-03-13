@@ -39,10 +39,22 @@ objc2-app-kit = { version = "0.3.2", features = [
     "NSSavePanel",
     "NSPanel",
     "NSStackView",
+    "NSWindowTab",
     "NSWindowTabGroup",
+    "NSMenu",
+    "NSMenuItem",
+    "NSEvent",
+    "NSAlert",
+    "NSScrollView",
+    "NSTextView",
+    "NSTrackingArea",
 ] }
 objc2-pdf-kit = { version = "0.3.2", features = [
     "PDFView",
     "PDFDocument",
     "PDFPage",
+    "PDFAnnotation",
+    "PDFAnnotationMarkup",
+    "PDFAnnotationUtilities",
+    "PDFSelection",
 ] }

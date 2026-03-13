@@ -9,7 +9,9 @@ use objc2_app_kit::{
     NSVisualEffectView,
 };
 use objc2_foundation::{ns_string, MainThreadMarker, NSArray};
-use objc2_pdf_kit::{PDFDisplayMode, PDFView};
+use objc2_pdf_kit::PDFDisplayMode;
+
+use crate::pdf_view::FoliumPDFView;
 
 pub fn make_visual_effect_view(
     mtm: MainThreadMarker,
@@ -87,15 +89,15 @@ pub fn build_blank_view(
 /// Build a PDFView configured for folium:
 /// continuous single-page layout, page-break shadows (each page appears as
 /// a white card floating on the background — PDFKit renders this natively).
-pub fn build_pdf_view(mtm: MainThreadMarker) -> Retained<PDFView> {
+pub fn build_pdf_view(mtm: MainThreadMarker) -> Retained<FoliumPDFView> {
+    let pdf_view = FoliumPDFView::new(mtm);
     unsafe {
-        let pdf_view = PDFView::new(mtm);
         pdf_view.setDisplayMode(PDFDisplayMode::SinglePageContinuous);
         pdf_view.setDisplaysPageBreaks(true);
         pdf_view.setAutoScales(false);
         pdf_view.setScaleFactor(1.0);
         // Background behind page cards.
         pdf_view.setBackgroundColor(&NSColor::windowBackgroundColor());
-        pdf_view
     }
+    pdf_view
 }

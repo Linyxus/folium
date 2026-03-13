@@ -22,6 +22,8 @@ objc2-app-kit = { version = "0.3.2", features = [
     "NSLayoutConstraint",
     "NSControl",
     "NSButton",
+    "NSButtonCell",
+    "NSCell",
     "NSTextField",
     "NSColor",
     "NSFont",
@@ -33,11 +35,17 @@ objc2-app-kit = { version = "0.3.2", features = [
     "NSToolbar",
     "NSToolbarItem",
     "NSScrollView",
+    "NSClipView",
     "NSImageView",
     "NSImageRep",
     "NSBitmapImageRep",
     "NSOpenPanel",
     "NSSavePanel",
     "NSPanel",
+    "NSStackView",
+    "NSWindowTabGroup",
+    "NSGestureRecognizer",
+    "NSMagnificationGestureRecognizer",
 ] }
 pdfium-render = { version = "0.8", features = ["image"] }
+dispatch = "0.2"

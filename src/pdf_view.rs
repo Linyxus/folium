@@ -698,39 +698,33 @@ impl FoliumPDFView {
         scroll_view.setTranslatesAutoresizingMaskIntoConstraints(false);
         scroll_view.setDocumentView(Some(&text_view));
 
-        let save_btn = unsafe {
-            NSButton::buttonWithTitle_target_action(
-                ns_string!(""),
-                Some(&*target),
-                Some(sel!(saveNote:)),
-                mtm,
-            )
-        };
-        if let Some(img) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-            ns_string!("checkmark.circle.fill"),
-            Some(ns_string!("Save")),
-        ) {
-            save_btn.setImage(Some(&img));
-        }
-        save_btn.setBordered(false);
-        save_btn.setTranslatesAutoresizingMaskIntoConstraints(false);
-
+        // Cancel button — Escape shortcut
         let cancel_btn = unsafe {
             NSButton::buttonWithTitle_target_action(
-                ns_string!(""),
+                ns_string!("Cancel  Esc"),
                 Some(&*target),
                 Some(sel!(cancelNote:)),
                 mtm,
             )
         };
-        if let Some(img) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-            ns_string!("xmark.circle"),
-            Some(ns_string!("Cancel")),
-        ) {
-            cancel_btn.setImage(Some(&img));
-        }
-        cancel_btn.setBordered(false);
+        cancel_btn.setKeyEquivalent(ns_string!("\u{1b}")); // Escape
         cancel_btn.setTranslatesAutoresizingMaskIntoConstraints(false);
+
+        // Ok button — Cmd+Enter shortcut
+        let save_btn = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                ns_string!("Ok  \u{2318}\u{23ce}"),
+                Some(&*target),
+                Some(sel!(saveNote:)),
+                mtm,
+            )
+        };
+        save_btn.setKeyEquivalent(ns_string!("\r"));
+        unsafe {
+            let mods = objc2_app_kit::NSEventModifierFlags::Command;
+            let _: () = msg_send![&*save_btn, setKeyEquivalentModifierMask: mods];
+        }
+        save_btn.setTranslatesAutoresizingMaskIntoConstraints(false);
 
         let vev = NSVisualEffectView::new(mtm);
         vev.setMaterial(NSVisualEffectMaterial::Popover);
@@ -749,10 +743,10 @@ impl FoliumPDFView {
         }
 
         let pad = 12.0;
-        let btn_sz = 20.0;
         let vev_view: &objc2_app_kit::NSView = &vev;
         objc2_app_kit::NSLayoutConstraint::activateConstraints(
             &objc2_foundation::NSArray::from_retained_slice(&[
+                // Text area
                 scroll_view
                     .topAnchor()
                     .constraintEqualToAnchor_constant(&vev_view.topAnchor(), pad),
@@ -762,6 +756,7 @@ impl FoliumPDFView {
                 scroll_view
                     .trailingAnchor()
                     .constraintEqualToAnchor_constant(&vev_view.trailingAnchor(), -pad),
+                // Button row
                 save_btn
                     .topAnchor()
                     .constraintEqualToAnchor_constant(&scroll_view.bottomAnchor(), 6.0),
@@ -771,16 +766,12 @@ impl FoliumPDFView {
                 save_btn
                     .trailingAnchor()
                     .constraintEqualToAnchor_constant(&vev_view.trailingAnchor(), -pad),
-                save_btn.widthAnchor().constraintEqualToConstant(btn_sz),
-                save_btn.heightAnchor().constraintEqualToConstant(btn_sz),
                 cancel_btn
                     .centerYAnchor()
                     .constraintEqualToAnchor(&save_btn.centerYAnchor()),
                 cancel_btn
                     .trailingAnchor()
-                    .constraintEqualToAnchor_constant(&save_btn.leadingAnchor(), -6.0),
-                cancel_btn.widthAnchor().constraintEqualToConstant(btn_sz),
-                cancel_btn.heightAnchor().constraintEqualToConstant(btn_sz),
+                    .constraintEqualToAnchor_constant(&save_btn.leadingAnchor(), -8.0),
             ]),
         );
 

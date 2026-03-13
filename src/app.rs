@@ -7,7 +7,9 @@ use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSMenu, NSMenuItem,
     NSWindow, NSWindowDelegate, NSWindowOrderingMode,
 };
-use objc2_foundation::{ns_string, MainThreadMarker, NSNotification, NSObject, NSObjectProtocol};
+use objc2_foundation::{
+    ns_string, MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSString,
+};
 
 use crate::tab::TabController;
 
@@ -136,6 +138,15 @@ impl AppDelegate {
             )
         };
         file_menu.addItem(&open);
+        let save = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                ns_string!("Save"),
+                Some(sel!(saveDocument:)),
+                ns_string!("s"),
+            )
+        };
+        file_menu.addItem(&save);
         let close = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 NSMenuItem::alloc(mtm),
@@ -147,6 +158,30 @@ impl AppDelegate {
         file_menu.addItem(&close);
         file_item.setSubmenu(Some(&file_menu));
         menu_bar.addItem(&file_item);
+
+        // ── Edit menu (enables standard text-editing shortcuts) ──
+        let edit_item = NSMenuItem::new(mtm);
+        let edit_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Edit"));
+        for (title, action, key) in [
+            ("Undo",       sel!(undo:),      "z"),
+            ("Redo",       sel!(redo:),       "Z"),
+            ("Cut",        sel!(cut:),        "x"),
+            ("Copy",       sel!(copy:),       "c"),
+            ("Paste",      sel!(paste:),      "v"),
+            ("Select All", sel!(selectAll:),  "a"),
+        ] {
+            let item = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    &NSString::from_str(title),
+                    Some(action),
+                    &NSString::from_str(key),
+                )
+            };
+            edit_menu.addItem(&item);
+        }
+        edit_item.setSubmenu(Some(&edit_menu));
+        menu_bar.addItem(&edit_item);
 
         // ── Window menu (macOS injects tab management here) ──────
         let win_item = NSMenuItem::new(mtm);

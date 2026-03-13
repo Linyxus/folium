@@ -78,6 +78,19 @@ define_class!(
             self.show_annotation_bar(view_rect);
         }
 
+        // ── Save ──────────────────────────────────────────────────
+
+        #[unsafe(method(saveDocument:))]
+        fn save_document(&self, _sender: Option<&AnyObject>) {
+            let doc = unsafe { self.document() };
+            let Some(doc) = doc else { return };
+            let url = unsafe { doc.documentURL() };
+            let Some(url) = url else { return };
+            if unsafe { doc.writeToURL(&url) } {
+                self.mark_saved();
+            }
+        }
+
         // ── Annotation actions ───────────────────────────────────
 
         #[unsafe(method(deleteAnnotation:))]
@@ -91,6 +104,7 @@ define_class!(
             }
             self.hide_annotation_bar();
             *self.ivars().active_annotation.borrow_mut() = None;
+            self.mark_edited();
         }
 
         #[unsafe(method(addAnnotationNote:))]
@@ -155,6 +169,7 @@ define_class!(
                 unsafe { page.addAnnotation(&annotation) };
             }
             unsafe { self.clearSelection() };
+            self.mark_edited();
         }
 
         #[unsafe(method(highlightAndAddNote:))]
@@ -183,6 +198,7 @@ define_class!(
                 }
             }
             unsafe { self.clearSelection() };
+            self.mark_edited();
 
             if let Some(annotation) = first_annotation {
                 self.show_note_editor(annotation);
@@ -205,6 +221,7 @@ define_class!(
                 }
             }
             self.hide_note_editor();
+            self.mark_edited();
         }
 
         #[unsafe(method(cancelNote:))]
@@ -927,5 +944,47 @@ impl FoliumPDFView {
         let ann = self.ivars().active_annotation.borrow();
         let Some(ref a) = *ann else { return };
         unsafe { a.setColor(color) };
+        drop(ann);
+        self.mark_edited();
+    }
+
+    fn mark_edited(&self) {
+        if let Some(window) = self.window() {
+            if !window.isDocumentEdited() {
+                window.setDocumentEdited(true);
+                let mtm = MainThreadMarker::from(self);
+                let dot_size = 7.0;
+                let dot = NSTextField::new(mtm);
+                dot.setEditable(false);
+                dot.setSelectable(false);
+                dot.setBezeled(false);
+                dot.setStringValue(ns_string!(""));
+                dot.setDrawsBackground(true);
+                dot.setBackgroundColor(Some(&NSColor::orangeColor()));
+                dot.setTranslatesAutoresizingMaskIntoConstraints(false);
+                dot.setWantsLayer(true);
+                unsafe {
+                    let layer: Option<&AnyObject> = msg_send![&*dot, layer];
+                    if let Some(layer) = layer {
+                        let _: () = msg_send![layer, setCornerRadius: dot_size / 2.0];
+                        let _: () = msg_send![layer, setMasksToBounds: true];
+                    }
+                }
+                objc2_app_kit::NSLayoutConstraint::activateConstraints(
+                    &objc2_foundation::NSArray::from_retained_slice(&[
+                        dot.widthAnchor().constraintEqualToConstant(dot_size),
+                        dot.heightAnchor().constraintEqualToConstant(dot_size),
+                    ]),
+                );
+                window.tab().setAccessoryView(Some(&dot));
+            }
+        }
+    }
+
+    fn mark_saved(&self) {
+        if let Some(window) = self.window() {
+            window.setDocumentEdited(false);
+            window.tab().setAccessoryView(None);
+        }
     }
 }

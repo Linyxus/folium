@@ -27,25 +27,22 @@ objc2-app-kit = { version = "0.3.2", features = [
     "NSTextField",
     "NSColor",
     "NSFont",
-    "NSImage",
     "NSText",
     "NSRunningApplication",
     "NSGraphics",
     "NSUserInterfaceLayout",
     "NSToolbar",
     "NSToolbarItem",
-    "NSScrollView",
-    "NSClipView",
+    "NSImage",
     "NSImageView",
-    "NSImageRep",
-    "NSBitmapImageRep",
     "NSOpenPanel",
     "NSSavePanel",
     "NSPanel",
     "NSStackView",
     "NSWindowTabGroup",
-    "NSGestureRecognizer",
-    "NSMagnificationGestureRecognizer",
 ] }
-pdfium-render = { version = "0.8", features = ["image"] }
-dispatch = "0.2"
+objc2-pdf-kit = { version = "0.3.2", features = [
+    "PDFView",
+    "PDFDocument",
+    "PDFPage",
+] }

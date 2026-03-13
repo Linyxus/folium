@@ -1,14 +1,14 @@
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2::{sel, MainThreadOnly};
+use objc2::MainThreadOnly;
 use objc2_app_kit::{
-    NSBackingStoreType, NSMagnificationGestureRecognizer, NSToolbar, NSWindow, NSWindowStyleMask,
+    NSBackingStoreType, NSToolbar, NSWindow, NSWindowStyleMask,
     NSWindowTabbingMode, NSWindowToolbarStyle,
 };
 use objc2_foundation::{ns_string, MainThreadMarker, NSPoint, NSRect, NSSize};
 
 use crate::toolbar::ToolbarHandler;
-use crate::ui::{build_blank_view, build_pdf_container};
+use crate::ui::{build_blank_view, build_pdf_view};
 
 #[derive(Debug)]
 pub struct TabController {
@@ -24,8 +24,7 @@ impl TabController {
         let style = NSWindowStyleMask::Titled
             | NSWindowStyleMask::Closable
             | NSWindowStyleMask::Miniaturizable
-            | NSWindowStyleMask::Resizable
-            | NSWindowStyleMask::FullSizeContentView;
+            | NSWindowStyleMask::Resizable;
 
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1200.0, 800.0));
         let window = unsafe {
@@ -38,7 +37,6 @@ impl TabController {
             )
         };
         unsafe { window.setReleasedWhenClosed(false) };
-        window.setTitlebarAppearsTransparent(true);
         window.setTitle(ns_string!("New Tab"));
         window.setToolbarStyle(NSWindowToolbarStyle::Unified);
         window.setTabbingMode(NSWindowTabbingMode::Preferred);
@@ -48,31 +46,9 @@ impl TabController {
         // Build handler
         let handler = ToolbarHandler::new(mtm);
 
-        // Build PDF container view
-        let (pdf_view, scroll_view, card_view, image_view) = build_pdf_container(mtm);
-        handler.set_image_view(image_view);
-        handler.set_card_view(card_view);
-        handler.set_pdf_view(pdf_view.clone());
-
-        // Enable pinch-to-zoom on the scroll view.
-        // allowsMagnification gives smooth real-time visual feedback during the
-        // gesture; the gesture recognizer below triggers a crisp re-render when
-        // the pinch ends.
-        scroll_view.setAllowsMagnification(true);
-        scroll_view.setMinMagnification(0.1);
-        scroll_view.setMaxMagnification(20.0);
-        handler.set_scroll_view(scroll_view.clone());
-
-        let gr_target: &AnyObject =
-            unsafe { &*(Retained::as_ptr(&handler) as *const AnyObject) };
-        let gr = unsafe {
-            NSMagnificationGestureRecognizer::initWithTarget_action(
-                NSMagnificationGestureRecognizer::alloc(mtm),
-                Some(gr_target),
-                Some(sel!(handleMagnify:)),
-            )
-        };
-        scroll_view.addGestureRecognizer(&gr);
+        // Build PDFView and hand it to the handler
+        let pdf_view = build_pdf_view(mtm);
+        handler.set_pdf_view(pdf_view);
 
         // Build blank "open" view
         let target: &AnyObject =

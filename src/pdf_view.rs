@@ -4,21 +4,30 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSAlert, NSBackingStoreType, NSColor, NSEvent, NSMenu, NSMenuItem, NSPanel, NSScrollView,
-    NSTextField, NSTextView, NSTrackingArea, NSTrackingAreaOptions, NSWindowStyleMask,
+    NSAlert, NSBackingStoreType, NSBezelStyle, NSButton, NSColor, NSEvent, NSImage, NSMenu,
+    NSMenuItem, NSPanel, NSScrollView, NSTextField, NSTextView, NSTrackingArea,
+    NSTrackingAreaOptions, NSWindowStyleMask,
 };
 use objc2_foundation::{
-    ns_string, MainThreadMarker, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
+    ns_string, MainThreadMarker, NSNotification, NSNotificationCenter, NSObjectProtocol, NSPoint,
+    NSRect, NSSize, NSString,
 };
-use objc2_pdf_kit::{PDFAnnotation, PDFView};
+use objc2_pdf_kit::{
+    PDFAnnotation, PDFAnnotationSubtypeHighlight, PDFView, PDFViewSelectionChangedNotification,
+};
 
 #[derive(Debug, Default)]
 pub struct FoliumPDFViewIvars {
     active_annotation: RefCell<Option<Retained<PDFAnnotation>>>,
+    // Tooltip
     tooltip_tracking: OnceCell<Retained<NSTrackingArea>>,
     current_tooltip: RefCell<Option<Retained<NSString>>>,
     tooltip_panel: OnceCell<Retained<NSPanel>>,
     tooltip_label: OnceCell<Retained<NSTextField>>,
+    // Selection action panel
+    action_panel: OnceCell<Retained<NSPanel>>,
+    action_btn: OnceCell<Retained<NSButton>>,
+    selection_observer_registered: OnceCell<()>,
 }
 
 define_class!(
@@ -32,6 +41,8 @@ define_class!(
     unsafe impl NSObjectProtocol for FoliumPDFView {}
 
     impl FoliumPDFView {
+        // ── Context menu ─────────────────────────────────────────
+
         #[unsafe(method_id(menuForEvent:))]
         fn menu_for_event(&self, event: &NSEvent) -> Option<Retained<NSMenu>> {
             let win_point = event.locationInWindow();
@@ -69,9 +80,93 @@ define_class!(
             self.show_note_dialog(&annotation);
         }
 
+        #[unsafe(method(setAnnotationColorYellow:))]
+        fn set_annotation_color_yellow(&self, _sender: Option<&AnyObject>) {
+            self.set_active_annotation_color(&NSColor::yellowColor());
+        }
+
+        #[unsafe(method(setAnnotationColorGreen:))]
+        fn set_annotation_color_green(&self, _sender: Option<&AnyObject>) {
+            self.set_active_annotation_color(&NSColor::greenColor());
+        }
+
+        #[unsafe(method(setAnnotationColorBlue:))]
+        fn set_annotation_color_blue(&self, _sender: Option<&AnyObject>) {
+            self.set_active_annotation_color(&NSColor::blueColor());
+        }
+
+        #[unsafe(method(setAnnotationColorPink:))]
+        fn set_annotation_color_pink(&self, _sender: Option<&AnyObject>) {
+            self.set_active_annotation_color(&NSColor::systemPinkColor());
+        }
+
+        #[unsafe(method(setAnnotationColorRed:))]
+        fn set_annotation_color_red(&self, _sender: Option<&AnyObject>) {
+            self.set_active_annotation_color(&NSColor::redColor());
+        }
+
+        // ── Highlight action ─────────────────────────────────────
+
+        #[unsafe(method(highlightSelection:))]
+        fn highlight_selection(&self, _sender: Option<&AnyObject>) {
+            let selection = unsafe { self.currentSelection() };
+            let Some(selection) = selection else { return };
+
+            let color = NSColor::yellowColor();
+            let pages = unsafe { selection.pages() };
+            for i in 0..pages.count() {
+                let page = pages.objectAtIndex(i);
+                let bounds = unsafe { selection.boundsForPage(&page) };
+                let annotation = unsafe {
+                    PDFAnnotation::initWithBounds_forType_withProperties(
+                        PDFAnnotation::alloc(),
+                        bounds,
+                        &PDFAnnotationSubtypeHighlight,
+                        None,
+                    )
+                };
+                unsafe { annotation.setColor(&color) };
+                unsafe { page.addAnnotation(&annotation) };
+            }
+            unsafe { self.clearSelection() };
+        }
+
+        // ── Selection change notification ────────────────────────
+
+        #[unsafe(method(selectionDidChange:))]
+        fn selection_did_change(&self, _notification: &NSNotification) {
+            let selection = unsafe { self.currentSelection() };
+            match selection {
+                Some(sel) => {
+                    let pages = unsafe { sel.pages() };
+                    if pages.count() == 0 {
+                        self.hide_action_panel();
+                        return;
+                    }
+                    // Use the first page's selection bounds to position the panel.
+                    let page = pages.objectAtIndex(0);
+                    let page_rect = unsafe { sel.boundsForPage(&page) };
+                    if page_rect.size.width < 1.0 {
+                        self.hide_action_panel();
+                        return;
+                    }
+                    let view_rect = unsafe { self.convertRect_fromPage(page_rect, &page) };
+                    self.show_action_panel(view_rect);
+                }
+                None => self.hide_action_panel(),
+            }
+        }
+
+        // ── Tooltip tracking ─────────────────────────────────────
+
         #[unsafe(method(updateTrackingAreas))]
         fn update_tracking_areas(&self) {
             unsafe { msg_send![super(self), updateTrackingAreas] }
+            // Register selection observer once.
+            if self.ivars().selection_observer_registered.get().is_none() {
+                self.register_selection_observer();
+                let _ = self.ivars().selection_observer_registered.set(());
+            }
             if self.ivars().tooltip_tracking.get().is_some() {
                 return;
             }
@@ -131,31 +226,6 @@ define_class!(
             *self.ivars().current_tooltip.borrow_mut() = None;
             unsafe { msg_send![super(self), mouseExited: event] }
         }
-
-        #[unsafe(method(setAnnotationColorYellow:))]
-        fn set_annotation_color_yellow(&self, _sender: Option<&AnyObject>) {
-            self.set_active_annotation_color(&NSColor::yellowColor());
-        }
-
-        #[unsafe(method(setAnnotationColorGreen:))]
-        fn set_annotation_color_green(&self, _sender: Option<&AnyObject>) {
-            self.set_active_annotation_color(&NSColor::greenColor());
-        }
-
-        #[unsafe(method(setAnnotationColorBlue:))]
-        fn set_annotation_color_blue(&self, _sender: Option<&AnyObject>) {
-            self.set_active_annotation_color(&NSColor::blueColor());
-        }
-
-        #[unsafe(method(setAnnotationColorPink:))]
-        fn set_annotation_color_pink(&self, _sender: Option<&AnyObject>) {
-            self.set_active_annotation_color(&NSColor::systemPinkColor());
-        }
-
-        #[unsafe(method(setAnnotationColorRed:))]
-        fn set_annotation_color_red(&self, _sender: Option<&AnyObject>) {
-            self.set_active_annotation_color(&NSColor::redColor());
-        }
     }
 );
 
@@ -163,6 +233,94 @@ impl FoliumPDFView {
     pub fn new(mtm: MainThreadMarker) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(FoliumPDFViewIvars::default());
         unsafe { objc2::msg_send![super(this), init] }
+    }
+
+    // ── Selection observer ───────────────────────────────────────
+
+    fn register_selection_observer(&self) {
+        let center = NSNotificationCenter::defaultCenter();
+        let observer = self as *const FoliumPDFView as *const AnyObject;
+        let object = self as *const FoliumPDFView as *const AnyObject;
+        unsafe {
+            center.addObserver_selector_name_object(
+                &*observer,
+                sel!(selectionDidChange:),
+                Some(&PDFViewSelectionChangedNotification),
+                Some(&*object),
+            );
+        }
+    }
+
+    // ── Selection action panel ───────────────────────────────────
+
+    fn ensure_action_panel(&self) {
+        if self.ivars().action_panel.get().is_some() {
+            return;
+        }
+        let mtm = MainThreadMarker::from(self);
+
+        let target = self as *const FoliumPDFView as *const AnyObject;
+        let btn = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                ns_string!(""),
+                Some(&*target),
+                Some(sel!(highlightSelection:)),
+                mtm,
+            )
+        };
+        if let Some(img) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+            ns_string!("highlighter"),
+            Some(ns_string!("Highlight")),
+        ) {
+            btn.setImage(Some(&img));
+        }
+        btn.setBezelStyle(NSBezelStyle::Glass);
+
+        let panel: Retained<NSPanel> = unsafe {
+            msg_send![
+                NSPanel::alloc(mtm),
+                initWithContentRect: NSRect::ZERO,
+                styleMask: NSWindowStyleMask::empty(),
+                backing: NSBackingStoreType::Buffered,
+                defer: true
+            ]
+        };
+        panel.setLevel(3); // NSFloatingWindowLevel
+        panel.setHasShadow(true);
+        unsafe { panel.setReleasedWhenClosed(false) };
+        panel.setContentView(Some(&btn));
+
+        let _ = self.ivars().action_btn.set(btn);
+        let _ = self.ivars().action_panel.set(panel);
+    }
+
+    fn show_action_panel(&self, selection_view_rect: NSRect) {
+        self.ensure_action_panel();
+        let panel = self.ivars().action_panel.get().unwrap();
+
+        let btn_size = 36.0;
+        let Some(window) = self.window() else { return };
+
+        // Position the panel centered above the selection.
+        let top_center = NSPoint::new(
+            selection_view_rect.origin.x + selection_view_rect.size.width / 2.0,
+            selection_view_rect.origin.y + selection_view_rect.size.height,
+        );
+        let win_point = self.convertPoint_toView(top_center, None);
+        let screen_point = window.convertPointToScreen(win_point);
+        let origin = NSPoint::new(
+            screen_point.x - btn_size / 2.0,
+            screen_point.y + 6.0,
+        );
+        let frame = NSRect::new(origin, NSSize::new(btn_size, btn_size));
+        panel.setFrame_display(frame, true);
+        panel.orderFront(None);
+    }
+
+    fn hide_action_panel(&self) {
+        if let Some(panel) = self.ivars().action_panel.get() {
+            panel.orderOut(None);
+        }
     }
 
     // ── Tooltip panel ────────────────────────────────────────────
@@ -188,7 +346,7 @@ impl FoliumPDFView {
                 defer: true
             ]
         };
-        panel.setLevel(3); // NSFloatingWindowLevel
+        panel.setLevel(3);
         panel.setIgnoresMouseEvents(true);
         panel.setHasShadow(true);
         unsafe { panel.setReleasedWhenClosed(false) };
@@ -257,7 +415,6 @@ impl FoliumPDFView {
         scroll_view.setDocumentView(Some(&text_view));
         alert.setAccessoryView(Some(&scroll_view));
 
-        // NSAlertFirstButtonReturn == 1000
         let response = alert.runModal();
         if response == 1000 {
             let note = text_view.string();

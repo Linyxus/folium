@@ -1,9 +1,8 @@
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, ProtocolObject};
+use objc2::runtime::AnyObject;
 use objc2::MainThreadOnly;
 use objc2_app_kit::{
-    NSBackingStoreType, NSToolbar, NSWindow, NSWindowStyleMask,
-    NSWindowTabbingMode, NSWindowToolbarStyle,
+    NSBackingStoreType, NSWindow, NSWindowStyleMask, NSWindowTabbingMode,
 };
 use objc2_foundation::{ns_string, MainThreadMarker, NSPoint, NSRect, NSSize};
 
@@ -13,14 +12,12 @@ use crate::ui::{build_blank_view, build_pdf_view};
 #[derive(Debug)]
 pub struct TabController {
     pub window: Retained<NSWindow>,
-    // Kept alive so ObjC callbacks on the toolbar delegate remain valid.
     #[allow(dead_code)]
     handler: Retained<ToolbarHandler>,
 }
 
 impl TabController {
     pub fn new(mtm: MainThreadMarker) -> Self {
-        // Build window
         let style = NSWindowStyleMask::Titled
             | NSWindowStyleMask::Closable
             | NSWindowStyleMask::Miniaturizable
@@ -38,36 +35,21 @@ impl TabController {
         };
         unsafe { window.setReleasedWhenClosed(false) };
         window.setTitle(ns_string!("New Tab"));
-        window.setToolbarStyle(NSWindowToolbarStyle::Unified);
         window.setTabbingMode(NSWindowTabbingMode::Preferred);
         window.setTabbingIdentifier(ns_string!("FoliumTabGroup"));
         window.center();
 
-        // Build handler
         let handler = ToolbarHandler::new(mtm);
+        let target: &AnyObject =
+            unsafe { &*(Retained::as_ptr(&handler) as *const AnyObject) };
 
-        // Build PDFView and hand it to the handler
         let pdf_view = build_pdf_view(mtm);
         handler.set_pdf_view(pdf_view);
 
-        // Build blank "open" view
-        let target: &AnyObject =
-            unsafe { &*(Retained::as_ptr(&handler) as *const AnyObject) };
         let blank_view = build_blank_view(mtm, target);
         handler.set_blank_view(blank_view.clone());
-
-        // Build toolbar and attach it immediately so chrome height stays constant.
-        let toolbar = NSToolbar::initWithIdentifier(
-            NSToolbar::alloc(mtm),
-            ns_string!("FoliumToolbar"),
-        );
-        toolbar.setDelegate(Some(ProtocolObject::from_ref(&*handler)));
-        window.setToolbar(Some(&*toolbar));
-
-        // Wire window reference into handler
         handler.set_window(window.clone());
 
-        // Start in blank state with blank content view
         window.setContentView(Some(&*blank_view));
 
         TabController { window, handler }

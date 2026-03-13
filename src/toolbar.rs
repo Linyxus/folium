@@ -1,17 +1,13 @@
 use std::cell::OnceCell;
 
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, Sel};
-use objc2::{define_class, sel, AnyThread, DefinedClass, MainThreadOnly};
-use objc2_app_kit::{
-    NSButton, NSColor, NSImage, NSModalResponseOK, NSOpenPanel,
-    NSToolbar, NSToolbarDelegate,
-    NSToolbarItem, NSView, NSWindow,
-};
+use objc2::runtime::AnyObject;
+use objc2::{define_class, AnyThread, DefinedClass, MainThreadOnly};
+use objc2_app_kit::{NSModalResponseOK, NSOpenPanel, NSView, NSWindow};
 use objc2_foundation::{
     ns_string, MainThreadMarker, NSArray, NSObject, NSObjectProtocol, NSString, NSURL,
 };
-use objc2_pdf_kit::{PDFAnnotation, PDFAnnotationSubtypeHighlight, PDFDocument};
+use objc2_pdf_kit::PDFDocument;
 
 use crate::pdf_view::FoliumPDFView;
 
@@ -42,67 +38,7 @@ define_class!(
 
     unsafe impl NSObjectProtocol for ToolbarHandler {}
 
-    unsafe impl NSToolbarDelegate for ToolbarHandler {
-        #[unsafe(method_id(toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:))]
-        fn toolbar_itemForItemIdentifier_willBeInsertedIntoToolbar(
-            &self,
-            _toolbar: &NSToolbar,
-            item_identifier: &NSString,
-            _flag: bool,
-        ) -> Option<Retained<NSToolbarItem>> {
-            let mtm = MainThreadMarker::from(self);
-            let id_str = item_identifier.to_string();
-            match id_str.as_str() {
-                "highlight" => {
-                    let item = NSToolbarItem::initWithItemIdentifier(
-                        NSToolbarItem::alloc(mtm),
-                        item_identifier,
-                    );
-                    let btn = make_symbol_button(
-                        mtm, self,
-                        ns_string!("highlighter"),
-                        ns_string!("Highlight"),
-                        sel!(highlightSelection:),
-                    );
-                    item.setView(Some(&btn));
-                    item.setLabel(ns_string!("Highlight"));
-                    Some(item)
-                }
-                _ => None,
-            }
-        }
-
-        #[unsafe(method_id(toolbarDefaultItemIdentifiers:))]
-        fn toolbarDefaultItemIdentifiers(
-            &self,
-            _toolbar: &NSToolbar,
-        ) -> Retained<NSArray<NSString>> {
-            NSArray::from_slice(&[
-                ns_string!("NSToolbarFlexibleSpaceItem"),
-                ns_string!("highlight"),
-            ])
-        }
-
-        #[unsafe(method_id(toolbarAllowedItemIdentifiers:))]
-        fn toolbarAllowedItemIdentifiers(
-            &self,
-            _toolbar: &NSToolbar,
-        ) -> Retained<NSArray<NSString>> {
-            NSArray::from_slice(&[
-                ns_string!("NSToolbarFlexibleSpaceItem"),
-                ns_string!("highlight"),
-            ])
-        }
-    }
-
-    // Non-protocol ObjC action methods
     impl ToolbarHandler {
-        #[unsafe(method(highlightSelection:))]
-        fn highlight_selection(&self, _sender: Option<&AnyObject>) {
-            let color = NSColor::yellowColor();
-            self.apply_markup(unsafe { &PDFAnnotationSubtypeHighlight }, &color);
-        }
-
         #[unsafe(method(openDocument:))]
         fn open_document(&self, _sender: Option<&AnyObject>) {
             let mtm = MainThreadMarker::from(self);
@@ -122,27 +58,6 @@ define_class!(
         }
     }
 );
-
-fn make_symbol_button(
-    mtm: MainThreadMarker,
-    target: &ToolbarHandler,
-    symbol: &NSString,
-    label: &NSString,
-    action: Sel,
-) -> Retained<NSButton> {
-    let btn = unsafe {
-        NSButton::buttonWithTitle_target_action(
-            ns_string!(""),
-            Some(&*(target as *const ToolbarHandler as *const AnyObject)),
-            Some(action),
-            mtm,
-        )
-    };
-    if let Some(img) = NSImage::imageWithSystemSymbolName_accessibilityDescription(symbol, Some(label)) {
-        btn.setImage(Some(&img));
-    }
-    btn
-}
 
 impl ToolbarHandler {
     pub fn new(mtm: MainThreadMarker) -> Retained<Self> {
@@ -168,30 +83,7 @@ impl ToolbarHandler {
         window.setContentView(Some(&**pdf_view));
         let title = NSString::from_str(filename);
         window.setTitle(&title);
-        // Set the tab label independently so it shows the filename in the tab strip.
         window.tab().setTitle(Some(&title));
-    }
-
-    fn apply_markup(&self, subtype: &NSString, color: &NSColor) {
-        let Some(pv) = self.ivars().pdf_view.get() else { return };
-        let selection = unsafe { pv.currentSelection() };
-        let Some(selection) = selection else { return };
-
-        let pages = unsafe { selection.pages() };
-        for i in 0..pages.count() {
-            let page = pages.objectAtIndex(i);
-            let bounds = unsafe { selection.boundsForPage(&page) };
-            let annotation = unsafe {
-                PDFAnnotation::initWithBounds_forType_withProperties(
-                    PDFAnnotation::alloc(),
-                    bounds,
-                    subtype,
-                    None,
-                )
-            };
-            unsafe { annotation.setColor(color) };
-            unsafe { page.addAnnotation(&annotation) };
-        }
     }
 
     fn load_url(&self, url: &NSURL) {

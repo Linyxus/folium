@@ -49,8 +49,9 @@ impl TabController {
         let handler = ToolbarHandler::new(mtm);
 
         // Build PDF container view
-        let (pdf_view, scroll_view, image_view) = build_pdf_container(mtm);
+        let (pdf_view, scroll_view, card_view, image_view) = build_pdf_container(mtm);
         handler.set_image_view(image_view);
+        handler.set_card_view(card_view);
         handler.set_pdf_view(pdf_view.clone());
 
         // Enable pinch-to-zoom on the scroll view.

@@ -23,11 +23,12 @@ use crate::pdf::{PdfStateData, RenderResult};
 const SCALE_MIN: f32 = 0.5;
 const SCALE_MAX: f32 = 20.0;
 use crate::pdfium::lock_pdfium;
-use crate::ui::{rgba_to_nsimage, SendPtr};
+use crate::ui::{rgba_to_nsimage, SendPtr, CARD_PADDING};
 
 #[derive(Debug)]
 pub struct ToolbarHandlerIvars {
     image_view: OnceCell<Retained<NSImageView>>,
+    card_view: OnceCell<Retained<NSView>>,
     page_label: OnceCell<Retained<NSTextField>>,
     pdf_state: RefCell<Option<PdfStateData>>,
     window: OnceCell<Retained<NSWindow>>,
@@ -48,6 +49,7 @@ impl Default for ToolbarHandlerIvars {
     fn default() -> Self {
         Self {
             image_view: OnceCell::new(),
+            card_view: OnceCell::new(),
             page_label: OnceCell::new(),
             pdf_state: RefCell::new(None),
             window: OnceCell::new(),
@@ -354,6 +356,10 @@ impl ToolbarHandler {
         self.ivars().image_view.set(image_view).unwrap();
     }
 
+    pub fn set_card_view(&self, card_view: Retained<NSView>) {
+        self.ivars().card_view.set(card_view).unwrap();
+    }
+
     pub fn set_window(&self, window: Retained<NSWindow>) {
         self.ivars().window.set(window).unwrap();
     }
@@ -410,6 +416,7 @@ impl ToolbarHandler {
 
     fn render_current_page(&self) {
         let Some(image_view) = self.ivars().image_view.get() else { return };
+        let Some(card_view)  = self.ivars().card_view.get()  else { return };
         let Some(scroll_view) = self.ivars().scroll_view.get() else { return };
 
         let mtm = MainThreadMarker::from(self);
@@ -438,6 +445,7 @@ impl ToolbarHandler {
         // Safety: all objects are retained by TabController for the app's lifetime;
         // all dereferences happen on the main thread inside exec_async.
         let iv_ptr   = SendPtr::new(Retained::as_ptr(image_view) as *const NSImageView);
+        let cv_ptr   = SendPtr::new(Retained::as_ptr(card_view)  as *const NSView);
         let sv_ptr   = SendPtr::new(Retained::as_ptr(scroll_view) as *const NSScrollView);
         let pl_ptr: Option<SendPtr<NSTextField>> = self.ivars().page_label.get()
             .map(|l| SendPtr::new(Retained::as_ptr(l) as *const NSTextField));
@@ -495,18 +503,19 @@ impl ToolbarHandler {
 
                 // Safety: main thread; objects alive for app lifetime.
                 let image_view  = unsafe { &*iv_ptr.as_ptr() };
+                let card_view   = unsafe { &*cv_ptr.as_ptr() };
                 let scroll_view = unsafe { &*sv_ptr.as_ptr() };
 
-                // Compute the fractional center of the visible area in the OLD document
-                // BEFORE swapping content.  This fraction is scale-invariant and
-                // will be used to restore the same page position afterwards.
+                // Compute the fractional center of the visible area relative to the
+                // card (document) BEFORE swapping content.  Card size is scale-invariant
+                // so the same fraction restores the same page position at any scale.
                 let (frac_cx, frac_cy) = {
-                    let vis      = scroll_view.documentVisibleRect();
-                    let doc_size = image_view.frame().size;
-                    if doc_size.width > 0.0 && doc_size.height > 0.0 {
+                    let vis       = scroll_view.documentVisibleRect();
+                    let card_size = card_view.frame().size;
+                    if card_size.width > 0.0 && card_size.height > 0.0 {
                         (
-                            (vis.origin.x + vis.size.width  / 2.0) / doc_size.width,
-                            (vis.origin.y + vis.size.height / 2.0) / doc_size.height,
+                            (vis.origin.x + vis.size.width  / 2.0) / card_size.width,
+                            (vis.origin.y + vis.size.height / 2.0) / card_size.height,
                         )
                     } else {
                         (0.5, 0.5)
@@ -514,20 +523,27 @@ impl ToolbarHandler {
                 };
 
                 let RenderResult { mut rgba, px_w, px_h, pt_w, pt_h, scale, page, page_count } = result;
-                let point_size = NSSize { width: pt_w, height: pt_h };
-                let ns_image = rgba_to_nsimage(&mut rgba, px_w, px_h, point_size);
+                let point_size  = NSSize { width: pt_w, height: pt_h };
+                let ns_image    = rgba_to_nsimage(&mut rgba, px_w, px_h, point_size);
 
+                // Place the image inset within the card; card carries the shadow margin.
+                let pad = CARD_PADDING;
                 image_view.setImage(Some(&ns_image));
-                image_view.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), point_size));
+                image_view.setFrame(NSRect::new(
+                    NSPoint::new(pad, pad),
+                    point_size,
+                ));
+                let card_size = NSSize {
+                    width:  pt_w + 2.0 * pad,
+                    height: pt_h + 2.0 * pad,
+                };
+                card_view.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), card_size));
                 scroll_view.setMagnification(1.0);
 
                 // Restore scroll position from the fractional center.
-                // Convert the fraction back to absolute doc coordinates in the NEW
-                // (possibly differently-sized) document and scroll so that point
-                // remains centered on screen.
                 let sv_size    = scroll_view.bounds().size;
-                let abs_cx     = frac_cx * pt_w;
-                let abs_cy     = frac_cy * pt_h;
+                let abs_cx     = frac_cx * card_size.width;
+                let abs_cy     = frac_cy * card_size.height;
                 let new_origin = NSPoint {
                     x: (abs_cx - sv_size.width  / 2.0).max(0.0),
                     y: (abs_cy - sv_size.height / 2.0).max(0.0),

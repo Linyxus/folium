@@ -199,11 +199,18 @@ pub fn build_blank_view(
     unsafe { Retained::cast_unchecked::<NSView>(vev) }
 }
 
+/// Padding (in points) added around the PDF page inside the card view.
+/// This space lets the drop shadow bleed out from the page without being
+/// clipped by the scroll view's clip view.
+pub const CARD_PADDING: f64 = 24.0;
+
 /// Build the PDF content view: a visual effect view containing a scroll view
-/// and a frame-based image view as the document view.
+/// whose document is a transparent "card" view.  The PDF image view lives
+/// inside the card, inset by `CARD_PADDING` on every side, and carries a
+/// drop shadow so the page appears to float above the background.
 pub fn build_pdf_container(
     mtm: MainThreadMarker,
-) -> (Retained<NSView>, Retained<NSScrollView>, Retained<NSImageView>) {
+) -> (Retained<NSView>, Retained<NSScrollView>, Retained<NSView>, Retained<NSImageView>) {
     let root_vev = make_visual_effect_view(
         mtm,
         NSVisualEffectMaterial::UnderWindowBackground,
@@ -219,12 +226,28 @@ pub fn build_pdf_container(
     root_vev.addSubview(&*scroll);
     pin_to_superview(&scroll, &root_vev);
 
+    // Card view — transparent container that is the scroll view's document.
+    // Its extra CARD_PADDING margin gives the drop shadow room to show.
+    let card = NSView::new(mtm);
+
     // NSImageScaling(2) == NSImageScaleNone
     let image_view = NSImageView::new(mtm);
     image_view.setImageScaling(NSImageScaling(2));
-    scroll.setDocumentView(Some(&*image_view));
+
+    // Layer-back the image view so Core Animation can render a drop shadow.
+    image_view.setWantsLayer(true);
+    unsafe {
+        let layer: *mut AnyObject = msg_send![&*image_view, layer];
+        // Shadow colour defaults to black; only opacity and geometry need setting.
+        let _: () = msg_send![layer, setShadowOpacity: 0.22_f32];
+        let _: () = msg_send![layer, setShadowRadius: 14.0_f64];
+        let _: () = msg_send![layer, setShadowOffset: NSSize { width: 0.0, height: -5.0 }];
+    }
+
+    card.addSubview(&*image_view);
+    scroll.setDocumentView(Some(&*card));
 
     let root = unsafe { Retained::cast_unchecked::<NSView>(root_vev) };
     let scroll = unsafe { Retained::cast_unchecked::<NSScrollView>(scroll) };
-    (root, scroll, image_view)
+    (root, scroll, card, image_view)
 }

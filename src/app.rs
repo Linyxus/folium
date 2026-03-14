@@ -11,7 +11,7 @@ use objc2_foundation::{
     ns_string, MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSString,
 };
 
-use crate::tab::TabController;
+use crate::tab::{self, TabController};
 
 #[derive(Debug, Default)]
 pub struct AppDelegateIvars {
@@ -40,15 +40,14 @@ define_class!(
 
             let cli_paths = crate::CLI_PATHS.get().cloned().unwrap_or_default();
             if cli_paths.is_empty() {
-                // No files — open a blank tab.
-                let tab = TabController::new(mtm, 0);
+                let tab = TabController::new(mtm);
                 tab.window.setDelegate(Some(ProtocolObject::from_ref(self)));
                 tab.window.makeKeyAndOrderFront(None);
+                tab::update_tab_shortcuts(&tab.window, mtm);
                 self.ivars().tabs.borrow_mut().push(tab);
             } else {
-                // Open each file in its own tab.
                 for (i, path) in cli_paths.iter().enumerate() {
-                    let tab = TabController::new(mtm, i);
+                    let tab = TabController::new(mtm);
                     tab.window.setDelegate(Some(ProtocolObject::from_ref(self)));
                     tab.load_file(path);
                     if i == 0 {
@@ -64,6 +63,11 @@ define_class!(
                         tab.window.makeKeyAndOrderFront(None);
                     }
                     self.ivars().tabs.borrow_mut().push(tab);
+                }
+                // Set shortcuts based on actual tab group order.
+                let tabs = self.ivars().tabs.borrow();
+                if let Some(first) = tabs.first() {
+                    tab::update_tab_shortcuts(&first.window, mtm);
                 }
             }
         }
@@ -81,6 +85,13 @@ define_class!(
             self.ivars().tabs.borrow_mut().retain(|t| {
                 Retained::as_ptr(&t.window) != win_ptr
             });
+
+            // Re-number remaining tab shortcuts.
+            let mtm = MainThreadMarker::from(self);
+            let tabs = self.ivars().tabs.borrow();
+            if let Some(first) = tabs.first() {
+                tab::update_tab_shortcuts(&first.window, mtm);
+            }
         }
     }
 
@@ -104,8 +115,7 @@ define_class!(
         #[unsafe(method(newWindowForTab:))]
         fn new_window_for_tab(&self, _sender: Option<&AnyObject>) {
             let mtm = MainThreadMarker::from(self);
-            let tab_index = self.ivars().tabs.borrow().len();
-            let tab = TabController::new(mtm, tab_index);
+            let tab = TabController::new(mtm);
             tab.window.setDelegate(Some(ProtocolObject::from_ref(self)));
             {
                 let tabs = self.ivars().tabs.borrow();
@@ -118,6 +128,12 @@ define_class!(
             }
             tab.window.makeKeyAndOrderFront(None);
             self.ivars().tabs.borrow_mut().push(tab);
+
+            // Re-number all tab shortcuts based on visual order.
+            let tabs = self.ivars().tabs.borrow();
+            if let Some(first) = tabs.first() {
+                tab::update_tab_shortcuts(&first.window, mtm);
+            }
         }
     }
 );

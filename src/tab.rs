@@ -19,7 +19,7 @@ pub struct TabController {
 }
 
 impl TabController {
-    pub fn new(mtm: MainThreadMarker, tab_index: usize) -> Self {
+    pub fn new(mtm: MainThreadMarker) -> Self {
         let style = NSWindowStyleMask::Titled
             | NSWindowStyleMask::Closable
             | NSWindowStyleMask::Miniaturizable
@@ -49,21 +49,6 @@ impl TabController {
         window.setToolbar(Some(&*toolbar));
         window.setToolbarStyle(NSWindowToolbarStyle::UnifiedCompact);
 
-        // Show keyboard shortcut on the tab (⌘1 … ⌘9).
-        if tab_index < 9 {
-            let text = NSString::from_str(&format!("\u{2318}{}", tab_index + 1));
-            let label = NSTextField::new(mtm);
-            label.setEditable(false);
-            label.setSelectable(false);
-            label.setBezeled(false);
-            label.setDrawsBackground(false);
-            label.setStringValue(&text);
-            label.setFont(Some(&NSFont::systemFontOfSize(NSFont::smallSystemFontSize())));
-            label.setTextColor(Some(&NSColor::tertiaryLabelColor()));
-            label.sizeToFit();
-            window.tab().setAccessoryView(Some(&label));
-        }
-
         let target: &AnyObject =
             unsafe { &*(Retained::as_ptr(&handler) as *const AnyObject) };
 
@@ -82,5 +67,31 @@ impl TabController {
     pub fn load_file(&self, path: &str) {
         let url = NSURL::fileURLWithPath(&NSString::from_str(path));
         self.handler.load_url(&url);
+    }
+}
+
+/// Update the ⌘N shortcut labels on all tabs based on their visual order
+/// in the tab group. Call this after any tab is added or removed.
+pub fn update_tab_shortcuts(window: &NSWindow, mtm: MainThreadMarker) {
+    let Some(tg) = window.tabGroup() else { return };
+    let windows = tg.windows();
+    for i in 0..windows.count() {
+        let w = windows.objectAtIndex(i);
+        let tab = w.tab();
+        if i < 9 {
+            let text = NSString::from_str(&format!("\u{2318}{}", i + 1));
+            let label = NSTextField::new(mtm);
+            label.setEditable(false);
+            label.setSelectable(false);
+            label.setBezeled(false);
+            label.setDrawsBackground(false);
+            label.setStringValue(&text);
+            label.setFont(Some(&NSFont::systemFontOfSize(NSFont::smallSystemFontSize())));
+            label.setTextColor(Some(&NSColor::tertiaryLabelColor()));
+            label.sizeToFit();
+            tab.setAccessoryView(Some(&label));
+        } else {
+            tab.setAccessoryView(None);
+        }
     }
 }

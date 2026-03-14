@@ -31,20 +31,41 @@ define_class!(
             if tab_bar {
                 // Delay one tick — the private view hierarchy isn't wired until
                 // the current run-loop iteration finishes.
+                // Then re-apply constraints on ALL windows in the tab group,
+                // not just this one — sibling windows also need fixing.
+                let null: *const AnyObject = std::ptr::null();
                 unsafe {
                     let _: () = msg_send![
                         self,
-                        performSelector: sel!(_pushTabsToTitlebar:),
-                        withObject: child,
+                        performSelector: sel!(_fixTabBarsInGroup:),
+                        withObject: null,
                         afterDelay: 0.0_f64
                     ];
                 }
             }
         }
 
-        #[unsafe(method(_pushTabsToTitlebar:))]
-        fn _push_tabs_to_titlebar(&self, child: &AnyObject) {
-            push_tabs_to_titlebar(child);
+        /// Re-apply tab-in-titlebar constraints on every window in this
+        /// window's tab group.
+        #[unsafe(method(_fixTabBarsInGroup:))]
+        fn _fix_tab_bars_in_group(&self, _sender: Option<&AnyObject>) {
+            // Collect all windows in the tab group.
+            let windows: Vec<Retained<AnyObject>> = if let Some(tg) = self.tabGroup() {
+                let ws: Retained<AnyObject> = unsafe { msg_send![&*tg, windows] };
+                let count: usize = unsafe { msg_send![&*ws, count] };
+                (0..count)
+                    .map(|i| unsafe { msg_send![&*ws, objectAtIndex: i] })
+                    .collect()
+            } else {
+                // No tab group — just fix this window.
+                let self_obj: Retained<AnyObject> =
+                    unsafe { msg_send![self, self] };
+                vec![self_obj]
+            };
+
+            for window in &windows {
+                fix_tab_bar_on_window(window);
+            }
         }
     }
 );
@@ -76,6 +97,29 @@ fn is_tab_bar(child: &AnyObject) -> bool {
     }
     let identifier: Option<Retained<AnyObject>> = unsafe { msg_send![child, identifier] };
     identifier.is_none()
+}
+
+/// Find the tab bar accessory VC on a window and re-apply constraints.
+fn fix_tab_bar_on_window(window: &AnyObject) {
+    let vcs: Retained<AnyObject> =
+        unsafe { msg_send![window, titlebarAccessoryViewControllers] };
+    let count: usize = unsafe { msg_send![&*vcs, count] };
+    for i in 0..count {
+        let vc: Retained<AnyObject> = unsafe { msg_send![&*vcs, objectAtIndex: i] };
+        let attr: i64 = unsafe { msg_send![&*vc, layoutAttribute] };
+        // We set the tab bar's layoutAttribute to .right (2).
+        // Fresh (not yet processed) tab bars have .bottom (4).
+        if attr == 2 || (attr == 4 && {
+            let id: Option<Retained<AnyObject>> = unsafe { msg_send![&*vc, identifier] };
+            id.is_none()
+        }) {
+            if attr == 4 {
+                unsafe { let _: () = msg_send![&*vc, setLayoutAttribute: 2_i64]; }
+            }
+            push_tabs_to_titlebar(&vc);
+            break;
+        }
+    }
 }
 
 /// Walk the private AppKit view hierarchy and constrain the tab bar's
@@ -121,7 +165,13 @@ fn push_tabs_to_titlebar(child: &AnyObject) {
         return;
     };
 
+    // Remove any stale constraints from a previous tab bar add/remove cycle.
     unsafe {
+        let old_c: Retained<AnyObject> = msg_send![&*clip_view, constraints];
+        let _: () = msg_send![&*clip_view, removeConstraints: &*old_c];
+        let old_a: Retained<AnyObject> = msg_send![&*accessory_view, constraints];
+        let _: () = msg_send![&*accessory_view, removeConstraints: &*old_a];
+
         let _: () = msg_send![&*clip_view, setTranslatesAutoresizingMaskIntoConstraints: false];
         let _: () =
             msg_send![&*accessory_view, setTranslatesAutoresizingMaskIntoConstraints: false];

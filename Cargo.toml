@@ -57,4 +57,5 @@ objc2-pdf-kit = { version = "0.3.2", features = [
     "PDFAnnotationMarkup",
     "PDFAnnotationUtilities",
     "PDFSelection",
+    "PDFDestination",
 ] }

@@ -1,15 +1,16 @@
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
+use std::time::SystemTime;
 
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2::{define_class, AnyThread, DefinedClass, MainThreadOnly};
+use objc2::{define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
     NSModalResponseOK, NSOpenPanel, NSToolbar, NSToolbarDelegate, NSToolbarItem, NSView, NSWindow,
 };
 use objc2_foundation::{
     ns_string, MainThreadMarker, NSArray, NSObject, NSObjectProtocol, NSString, NSURL,
 };
-use objc2_pdf_kit::PDFDocument;
+use objc2_pdf_kit::{PDFDestination, PDFDocument};
 
 use crate::pdf_view::FoliumPDFView;
 
@@ -18,6 +19,10 @@ pub struct ToolbarHandlerIvars {
     window:     OnceCell<Retained<NSWindow>>,
     blank_view: OnceCell<Retained<NSView>>,
     pdf_view:   OnceCell<Retained<FoliumPDFView>>,
+    // File watcher
+    watched_path: RefCell<Option<String>>,
+    file_mtime:   RefCell<Option<SystemTime>>,
+    watcher_active: RefCell<bool>,
 }
 
 impl Default for ToolbarHandlerIvars {
@@ -26,6 +31,9 @@ impl Default for ToolbarHandlerIvars {
             window:     OnceCell::new(),
             blank_view: OnceCell::new(),
             pdf_view:   OnceCell::new(),
+            watched_path:   RefCell::new(None),
+            file_mtime:     RefCell::new(None),
+            watcher_active: RefCell::new(false),
         }
     }
 }
@@ -90,6 +98,27 @@ define_class!(
                 }
             }
         }
+
+        #[unsafe(method(_checkFileChanged:))]
+        fn _check_file_changed(&self, _sender: Option<&AnyObject>) {
+            if let Some(path) = self.ivars().watched_path.borrow().as_ref() {
+                if let Ok(meta) = std::fs::metadata(path) {
+                    if let Ok(mtime) = meta.modified() {
+                        let changed = self
+                            .ivars()
+                            .file_mtime
+                            .borrow()
+                            .map_or(false, |old| mtime != old);
+                        if changed {
+                            *self.ivars().file_mtime.borrow_mut() = Some(mtime);
+                            self.reload_document();
+                        }
+                    }
+                }
+            }
+            // Re-schedule in 1 second.
+            self.schedule_file_check();
+        }
     }
 );
 
@@ -120,6 +149,19 @@ impl ToolbarHandler {
         window.tab().setTitle(Some(&title));
     }
 
+    fn schedule_file_check(&self) {
+        let self_ptr = self as *const ToolbarHandler as *const AnyObject;
+        let null: *const AnyObject = std::ptr::null();
+        unsafe {
+            let _: () = msg_send![
+                &*self_ptr,
+                performSelector: sel!(_checkFileChanged:),
+                withObject: null,
+                afterDelay: 1.0_f64
+            ];
+        }
+    }
+
     fn load_url(&self, url: &NSURL) {
         let Some(pv) = self.ivars().pdf_view.get() else { return };
         let doc = unsafe { PDFDocument::initWithURL(PDFDocument::alloc(), url) };
@@ -132,5 +174,53 @@ impl ToolbarHandler {
             .and_then(|n| n.to_str())
             .unwrap_or("Document");
         self.transition_to_pdf_view(filename);
+
+        // Start file watching.
+        let mtime = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
+        *self.ivars().watched_path.borrow_mut() = Some(path);
+        *self.ivars().file_mtime.borrow_mut() = mtime;
+        if !*self.ivars().watcher_active.borrow() {
+            *self.ivars().watcher_active.borrow_mut() = true;
+            self.schedule_file_check();
+        }
+    }
+
+    fn reload_document(&self) {
+        let Some(pv) = self.ivars().pdf_view.get() else { return };
+        let doc = unsafe { pv.document() };
+        let Some(doc) = doc else { return };
+        let url = unsafe { doc.documentURL() };
+        let Some(url) = url else { return };
+
+        // Save state.
+        let scale = unsafe { pv.scaleFactor() };
+        let destination = unsafe { pv.currentDestination() };
+        let page_index = destination.as_ref().and_then(|dest| {
+            let page = unsafe { dest.page() }?;
+            Some(unsafe { doc.indexForPage(&page) })
+        });
+
+        // Load the new document.
+        let new_doc = unsafe { PDFDocument::initWithURL(PDFDocument::alloc(), &url) };
+        let Some(new_doc) = new_doc else { return };
+        unsafe { pv.setDocument(Some(&new_doc)) };
+
+        // Restore state.
+        unsafe { pv.setScaleFactor(scale) };
+        if let (Some(dest), Some(idx)) = (&destination, page_index) {
+            let new_page_count = unsafe { new_doc.pageCount() };
+            let target_idx = idx.min(new_page_count.saturating_sub(1));
+            if let Some(new_page) = unsafe { new_doc.pageAtIndex(target_idx) } {
+                let point = unsafe { dest.point() };
+                let new_dest = unsafe {
+                    PDFDestination::initWithPage_atPoint(
+                        PDFDestination::alloc(),
+                        &new_page,
+                        point,
+                    )
+                };
+                unsafe { pv.goToDestination(&new_dest) };
+            }
+        }
     }
 }

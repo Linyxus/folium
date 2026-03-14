@@ -34,7 +34,6 @@ impl TabController {
         unsafe { window.setReleasedWhenClosed(false) };
         window.setTitle(ns_string!("New Tab"));
         window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
-        window.setTitlebarAppearsTransparent(true);
         window.setTabbingMode(NSWindowTabbingMode::Preferred);
         window.setTabbingIdentifier(ns_string!("FoliumTabGroup"));
         window.center();

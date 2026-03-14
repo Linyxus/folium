@@ -32,11 +32,9 @@ define_class!(
         fn did_finish_launching(&self, _notification: &NSNotification) {
             let mtm = MainThreadMarker::from(self);
 
-            let tab = TabController::new(mtm);
+            let tab = TabController::new(mtm, 0);
             tab.window.setDelegate(Some(ProtocolObject::from_ref(self)));
             tab.window.makeKeyAndOrderFront(None);
-            // Single tab on launch — hide tab bar regardless of system preference.
-            self.sync_tab_bar_for(&tab.window, false);
             self.ivars().tabs.borrow_mut().push(tab);
 
             let app = NSApplication::sharedApplication(mtm);
@@ -55,13 +53,6 @@ define_class!(
             let window: &NSWindow =
                 unsafe { &*(Retained::as_ptr(&obj) as *const NSWindow) };
 
-            // If dropping from 2 tabs to 1, hide the tab bar on the group.
-            if let Some(tg) = window.tabGroup() {
-                if tg.windows().count() == 2 && tg.isTabBarVisible() {
-                    window.toggleTabBar(None);
-                }
-            }
-
             // Remove the closed tab from our tracking vec.
             let win_ptr = window as *const NSWindow;
             self.ivars().tabs.borrow_mut().retain(|t| {
@@ -71,10 +62,27 @@ define_class!(
     }
 
     impl AppDelegate {
+        #[unsafe(method(selectTabByIndex:))]
+        fn select_tab_by_index(&self, sender: Option<&AnyObject>) {
+            let Some(sender) = sender else { return };
+            let tag: i64 = unsafe { msg_send![sender, tag] };
+            let mtm = MainThreadMarker::from(self);
+            let app = NSApplication::sharedApplication(mtm);
+            let Some(window) = app.keyWindow() else { return };
+            let Some(tg) = window.tabGroup() else { return };
+            let windows = tg.windows();
+            let idx = tag as usize;
+            if idx < windows.count() {
+                let target = windows.objectAtIndex(idx);
+                target.makeKeyAndOrderFront(None);
+            }
+        }
+
         #[unsafe(method(newWindowForTab:))]
         fn new_window_for_tab(&self, _sender: Option<&AnyObject>) {
             let mtm = MainThreadMarker::from(self);
-            let tab = TabController::new(mtm);
+            let tab_index = self.ivars().tabs.borrow().len();
+            let tab = TabController::new(mtm, tab_index);
             tab.window.setDelegate(Some(ProtocolObject::from_ref(self)));
             {
                 let tabs = self.ivars().tabs.borrow();
@@ -83,8 +91,6 @@ define_class!(
                         &tab.window,
                         NSWindowOrderingMode::Above,
                     );
-                    // Now 2+ tabs — show the tab bar.
-                    self.sync_tab_bar_for(&first.window, true);
                 }
             }
             tab.window.makeKeyAndOrderFront(None);
@@ -195,6 +201,21 @@ impl AppDelegate {
             )
         };
         win_menu.addItem(&minimize);
+        win_menu.addItem(&NSMenuItem::separatorItem(mtm));
+        for i in 1..=9u8 {
+            let title = NSString::from_str(&format!("Tab {}", i));
+            let key = NSString::from_str(&format!("{}", i));
+            let item = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    &title,
+                    Some(sel!(selectTabByIndex:)),
+                    &key,
+                )
+            };
+            item.setTag((i - 1) as isize);
+            win_menu.addItem(&item);
+        }
         win_item.setSubmenu(Some(&win_menu));
         menu_bar.addItem(&win_item);
 
@@ -204,15 +225,4 @@ impl AppDelegate {
         menu_bar
     }
 
-    /// Ensure the tab bar for `window`'s group matches `show`.
-    fn sync_tab_bar_for(&self, window: &NSWindow, show: bool) {
-        if let Some(tg) = window.tabGroup() {
-            let visible = tg.isTabBarVisible();
-            if show && !visible {
-                window.toggleTabBar(None);
-            } else if !show && visible {
-                window.toggleTabBar(None);
-            }
-        }
-    }
 }

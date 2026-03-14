@@ -950,41 +950,13 @@ impl FoliumPDFView {
 
     fn mark_edited(&self) {
         if let Some(window) = self.window() {
-            if !window.isDocumentEdited() {
-                window.setDocumentEdited(true);
-                let mtm = MainThreadMarker::from(self);
-                let dot_size = 7.0;
-                let dot = NSTextField::new(mtm);
-                dot.setEditable(false);
-                dot.setSelectable(false);
-                dot.setBezeled(false);
-                dot.setStringValue(ns_string!(""));
-                dot.setDrawsBackground(true);
-                dot.setBackgroundColor(Some(&NSColor::orangeColor()));
-                dot.setTranslatesAutoresizingMaskIntoConstraints(false);
-                dot.setWantsLayer(true);
-                unsafe {
-                    let layer: Option<&AnyObject> = msg_send![&*dot, layer];
-                    if let Some(layer) = layer {
-                        let _: () = msg_send![layer, setCornerRadius: dot_size / 2.0];
-                        let _: () = msg_send![layer, setMasksToBounds: true];
-                    }
-                }
-                objc2_app_kit::NSLayoutConstraint::activateConstraints(
-                    &objc2_foundation::NSArray::from_retained_slice(&[
-                        dot.widthAnchor().constraintEqualToConstant(dot_size),
-                        dot.heightAnchor().constraintEqualToConstant(dot_size),
-                    ]),
-                );
-                window.tab().setAccessoryView(Some(&dot));
-            }
+            window.setDocumentEdited(true);
         }
     }
 
     fn mark_saved(&self) {
         if let Some(window) = self.window() {
             window.setDocumentEdited(false);
-            window.tab().setAccessoryView(None);
         }
     }
 }

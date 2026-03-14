@@ -2,10 +2,10 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::MainThreadOnly;
 use objc2_app_kit::{
-    NSToolbar, NSWindow, NSWindowStyleMask, NSWindowTabbingMode, NSWindowTitleVisibility,
-    NSWindowToolbarStyle,
+    NSColor, NSFont, NSTextField, NSToolbar, NSWindow, NSWindowStyleMask, NSWindowTabbingMode,
+    NSWindowTitleVisibility, NSWindowToolbarStyle,
 };
-use objc2_foundation::{ns_string, MainThreadMarker, NSPoint, NSRect, NSSize};
+use objc2_foundation::{ns_string, MainThreadMarker, NSPoint, NSRect, NSSize, NSString};
 
 use crate::toolbar::ToolbarHandler;
 use crate::ui::{build_blank_view, build_pdf_view};
@@ -19,7 +19,7 @@ pub struct TabController {
 }
 
 impl TabController {
-    pub fn new(mtm: MainThreadMarker) -> Self {
+    pub fn new(mtm: MainThreadMarker, tab_index: usize) -> Self {
         let style = NSWindowStyleMask::Titled
             | NSWindowStyleMask::Closable
             | NSWindowStyleMask::Miniaturizable
@@ -49,6 +49,21 @@ impl TabController {
         toolbar.setDelegate(Some(ProtocolObject::from_ref(&*handler)));
         window.setToolbar(Some(&*toolbar));
         window.setToolbarStyle(NSWindowToolbarStyle::UnifiedCompact);
+
+        // Show keyboard shortcut on the tab (⌘1 … ⌘9).
+        if tab_index < 9 {
+            let text = NSString::from_str(&format!("\u{2318}{}", tab_index + 1));
+            let label = NSTextField::new(mtm);
+            label.setEditable(false);
+            label.setSelectable(false);
+            label.setBezeled(false);
+            label.setDrawsBackground(false);
+            label.setStringValue(&text);
+            label.setFont(Some(&NSFont::systemFontOfSize(NSFont::smallSystemFontSize())));
+            label.setTextColor(Some(&NSColor::tertiaryLabelColor()));
+            label.sizeToFit();
+            window.tab().setAccessoryView(Some(&label));
+        }
 
         let target: &AnyObject =
             unsafe { &*(Retained::as_ptr(&handler) as *const AnyObject) };

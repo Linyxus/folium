@@ -6,6 +6,7 @@ mod pdf_view;
 mod tab;
 mod toolbar;
 mod ui;
+mod window;
 
 use objc2::runtime::ProtocolObject;
 use objc2_app_kit::NSApplication;

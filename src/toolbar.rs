@@ -3,7 +3,9 @@ use std::cell::OnceCell;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{define_class, AnyThread, DefinedClass, MainThreadOnly};
-use objc2_app_kit::{NSModalResponseOK, NSOpenPanel, NSView, NSWindow};
+use objc2_app_kit::{
+    NSModalResponseOK, NSOpenPanel, NSToolbar, NSToolbarDelegate, NSToolbarItem, NSView, NSWindow,
+};
 use objc2_foundation::{
     ns_string, MainThreadMarker, NSArray, NSObject, NSObjectProtocol, NSString, NSURL,
 };
@@ -37,6 +39,38 @@ define_class!(
     pub struct ToolbarHandler;
 
     unsafe impl NSObjectProtocol for ToolbarHandler {}
+
+    unsafe impl NSToolbarDelegate for ToolbarHandler {
+        #[unsafe(method_id(toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:))]
+        fn toolbar_itemForItemIdentifier_willBeInsertedIntoToolbar(
+            &self,
+            _toolbar: &NSToolbar,
+            item_identifier: &NSString,
+            _flag: bool,
+        ) -> Option<Retained<NSToolbarItem>> {
+            let mtm = MainThreadMarker::from(self);
+            Some(NSToolbarItem::initWithItemIdentifier(
+                NSToolbarItem::alloc(mtm),
+                item_identifier,
+            ))
+        }
+
+        #[unsafe(method_id(toolbarDefaultItemIdentifiers:))]
+        fn toolbarDefaultItemIdentifiers(
+            &self,
+            _toolbar: &NSToolbar,
+        ) -> Retained<NSArray<NSString>> {
+            NSArray::from_slice(&[ns_string!("NSToolbarFlexibleSpaceItem")])
+        }
+
+        #[unsafe(method_id(toolbarAllowedItemIdentifiers:))]
+        fn toolbarAllowedItemIdentifiers(
+            &self,
+            _toolbar: &NSToolbar,
+        ) -> Retained<NSArray<NSString>> {
+            NSArray::from_slice(&[ns_string!("NSToolbarFlexibleSpaceItem")])
+        }
+    }
 
     impl ToolbarHandler {
         #[unsafe(method(openDocument:))]

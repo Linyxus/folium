@@ -68,6 +68,10 @@ impl TabController {
         let url = NSURL::fileURLWithPath(&NSString::from_str(path));
         self.handler.load_url(&url);
     }
+
+    pub fn has_document(&self) -> bool {
+        self.handler.has_document()
+    }
 }
 
 /// Update the ⌘N shortcut labels on all tabs based on their visual order

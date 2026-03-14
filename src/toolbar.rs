@@ -140,6 +140,14 @@ impl ToolbarHandler {
         self.ivars().pdf_view.set(view).unwrap();
     }
 
+    pub fn has_document(&self) -> bool {
+        self.ivars()
+            .pdf_view
+            .get()
+            .and_then(|pv| unsafe { pv.document() })
+            .is_some()
+    }
+
     fn transition_to_pdf_view(&self, filename: &str) {
         let window   = self.ivars().window.get().unwrap();
         let pdf_view = self.ivars().pdf_view.get().unwrap();

@@ -31,18 +31,41 @@ define_class!(
         #[unsafe(method(applicationDidFinishLaunching:))]
         fn did_finish_launching(&self, _notification: &NSNotification) {
             let mtm = MainThreadMarker::from(self);
-
-            let tab = TabController::new(mtm, 0);
-            tab.window.setDelegate(Some(ProtocolObject::from_ref(self)));
-            tab.window.makeKeyAndOrderFront(None);
-            self.ivars().tabs.borrow_mut().push(tab);
-
             let app = NSApplication::sharedApplication(mtm);
             let menu = AppDelegate::build_main_menu(mtm);
             app.setMainMenu(Some(&menu));
             app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
             #[allow(deprecated)]
             app.activateIgnoringOtherApps(true);
+
+            let cli_paths = crate::CLI_PATHS.get().cloned().unwrap_or_default();
+            if cli_paths.is_empty() {
+                // No files — open a blank tab.
+                let tab = TabController::new(mtm, 0);
+                tab.window.setDelegate(Some(ProtocolObject::from_ref(self)));
+                tab.window.makeKeyAndOrderFront(None);
+                self.ivars().tabs.borrow_mut().push(tab);
+            } else {
+                // Open each file in its own tab.
+                for (i, path) in cli_paths.iter().enumerate() {
+                    let tab = TabController::new(mtm, i);
+                    tab.window.setDelegate(Some(ProtocolObject::from_ref(self)));
+                    tab.load_file(path);
+                    if i == 0 {
+                        tab.window.makeKeyAndOrderFront(None);
+                    } else {
+                        let tabs = self.ivars().tabs.borrow();
+                        if let Some(first) = tabs.first() {
+                            first.window.addTabbedWindow_ordered(
+                                &tab.window,
+                                NSWindowOrderingMode::Above,
+                            );
+                        }
+                        tab.window.makeKeyAndOrderFront(None);
+                    }
+                    self.ivars().tabs.borrow_mut().push(tab);
+                }
+            }
         }
     }
 

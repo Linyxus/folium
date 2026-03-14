@@ -14,7 +14,13 @@ use objc2_foundation::MainThreadMarker;
 
 use app::AppDelegate;
 
+/// CLI file paths to open on launch, set before `app.run()`.
+pub static CLI_PATHS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
 fn main() {
+    let paths: Vec<String> = std::env::args().skip(1).collect();
+    let _ = CLI_PATHS.set(paths);
+
     let mtm = MainThreadMarker::new().unwrap();
     let app = NSApplication::sharedApplication(mtm);
     let delegate = AppDelegate::new(mtm);

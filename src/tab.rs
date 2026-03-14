@@ -5,7 +5,7 @@ use objc2_app_kit::{
     NSColor, NSFont, NSTextField, NSToolbar, NSWindow, NSWindowStyleMask, NSWindowTabbingMode,
     NSWindowTitleVisibility, NSWindowToolbarStyle,
 };
-use objc2_foundation::{ns_string, MainThreadMarker, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{ns_string, MainThreadMarker, NSPoint, NSRect, NSSize, NSString, NSURL};
 
 use crate::toolbar::ToolbarHandler;
 use crate::ui::{build_blank_view, build_pdf_view};
@@ -78,5 +78,10 @@ impl TabController {
         window.setContentView(Some(&*blank_view));
 
         TabController { window, handler }
+    }
+
+    pub fn load_file(&self, path: &str) {
+        let url = NSURL::fileURLWithPath(&NSString::from_str(path));
+        self.handler.load_url(&url);
     }
 }

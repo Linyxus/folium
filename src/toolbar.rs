@@ -162,7 +162,7 @@ impl ToolbarHandler {
         }
     }
 
-    fn load_url(&self, url: &NSURL) {
+    pub fn load_url(&self, url: &NSURL) {
         let Some(pv) = self.ivars().pdf_view.get() else { return };
         let doc = unsafe { PDFDocument::initWithURL(PDFDocument::alloc(), url) };
         let Some(doc) = doc else { return };

@@ -34,6 +34,9 @@ pub struct FoliumPDFViewIvars {
     note_panel: OnceCell<Retained<NSPanel>>,
     note_text_view: OnceCell<Retained<NSTextView>>,
     note_annotation: RefCell<Option<Retained<PDFAnnotation>>>,
+    // Find bar
+    find_panel: OnceCell<Retained<NSPanel>>,
+    find_field: OnceCell<Retained<NSTextField>>,
 }
 
 define_class!(
@@ -227,6 +230,53 @@ define_class!(
         #[unsafe(method(cancelNote:))]
         fn cancel_note(&self, _sender: Option<&AnyObject>) {
             self.hide_note_editor();
+        }
+
+        // ── Find ──────────────────────────────────────────────────
+
+        #[unsafe(method(showFindBar:))]
+        fn show_find_bar(&self, _sender: Option<&AnyObject>) {
+            self.ensure_find_panel();
+            let panel = self.ivars().find_panel.get().unwrap();
+            let field = self.ivars().find_field.get().unwrap();
+
+            // Position at the bottom-center of the PDF view.
+            let find_w = 360.0;
+            let find_h = 40.0;
+            if let Some(window) = self.window() {
+                let view_frame = self.frame();
+                let bottom_center = objc2_foundation::NSPoint::new(
+                    view_frame.origin.x + view_frame.size.width / 2.0,
+                    view_frame.origin.y + 8.0,
+                );
+                let win_point = self.convertPoint_toView(bottom_center, None);
+                let screen_point = window.convertPointToScreen(win_point);
+                let origin = objc2_foundation::NSPoint::new(
+                    screen_point.x - find_w / 2.0,
+                    screen_point.y + 4.0,
+                );
+                panel.setFrame_display(
+                    NSRect::new(origin, NSSize::new(find_w, find_h)),
+                    true,
+                );
+            }
+            panel.makeKeyAndOrderFront(None);
+            panel.makeFirstResponder(Some(field));
+        }
+
+        #[unsafe(method(findNext:))]
+        fn find_next(&self, _sender: Option<&AnyObject>) {
+            self.perform_find(false);
+        }
+
+        #[unsafe(method(findPrevious:))]
+        fn find_previous(&self, _sender: Option<&AnyObject>) {
+            self.perform_find(true);
+        }
+
+        #[unsafe(method(dismissFindBar:))]
+        fn dismiss_find_bar(&self, _sender: Option<&AnyObject>) {
+            self.hide_find_panel();
         }
 
         // ── Selection change notification ────────────────────────
@@ -936,6 +986,179 @@ impl FoliumPDFView {
         if let Some(panel) = self.ivars().tooltip_panel.get() {
             panel.orderOut(None);
         }
+    }
+
+    // ── Find panel ───────────────────────────────────────────────
+
+    fn ensure_find_panel(&self) {
+        if self.ivars().find_panel.get().is_some() {
+            return;
+        }
+        let mtm = MainThreadMarker::from(self);
+        let target = self as *const FoliumPDFView as *const AnyObject;
+
+        // Search field — Enter triggers findNext:.
+        let field = NSTextField::new(mtm);
+        field.setPlaceholderString(Some(ns_string!("Search in PDF\u{2026}")));
+        field.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+        field.setDrawsBackground(false);
+        field.setBezeled(false);
+        field.setTranslatesAutoresizingMaskIntoConstraints(false);
+        unsafe {
+            let _: () = msg_send![&*field, setTarget: &*target];
+            let _: () = msg_send![&*field, setAction: sel!(findNext:)];
+        }
+
+        // Navigation buttons.
+        let make_btn = |symbol: &NSString, label: &NSString, action: objc2::runtime::Sel| -> Retained<NSButton> {
+            let btn = unsafe {
+                NSButton::buttonWithTitle_target_action(
+                    ns_string!(""),
+                    Some(&*target),
+                    Some(action),
+                    mtm,
+                )
+            };
+            if let Some(img) =
+                NSImage::imageWithSystemSymbolName_accessibilityDescription(symbol, Some(label))
+            {
+                btn.setImage(Some(&img));
+            }
+            btn.setBordered(false);
+            btn.setTranslatesAutoresizingMaskIntoConstraints(false);
+            btn
+        };
+
+        let btn_prev = make_btn(
+            ns_string!("chevron.up"),
+            ns_string!("Previous"),
+            sel!(findPrevious:),
+        );
+        let btn_next = make_btn(
+            ns_string!("chevron.down"),
+            ns_string!("Next"),
+            sel!(findNext:),
+        );
+        let btn_close = make_btn(
+            ns_string!("xmark"),
+            ns_string!("Close"),
+            sel!(dismissFindBar:),
+        );
+        btn_close.setKeyEquivalent(ns_string!("\u{1b}")); // Escape
+
+        // Glass backdrop.
+        let vev = NSVisualEffectView::new(mtm);
+        vev.setMaterial(NSVisualEffectMaterial::Popover);
+        vev.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
+        vev.setState(NSVisualEffectState::Active);
+        vev.setWantsLayer(true);
+        vev.addSubview(&field);
+        vev.addSubview(&btn_prev);
+        vev.addSubview(&btn_next);
+        vev.addSubview(&btn_close);
+        unsafe {
+            let layer: Option<&AnyObject> = msg_send![&*vev, layer];
+            if let Some(layer) = layer {
+                let _: () = msg_send![layer, setCornerRadius: 10.0_f64];
+                let _: () = msg_send![layer, setMasksToBounds: true];
+            }
+        }
+
+        // Layout: [ field ──────────── ] [▲] [▼] [✕]
+        let icon_sz = 18.0;
+        let pad = 10.0;
+        let vev_view: &objc2_app_kit::NSView = &vev;
+        objc2_app_kit::NSLayoutConstraint::activateConstraints(
+            &objc2_foundation::NSArray::from_retained_slice(&[
+                field
+                    .leadingAnchor()
+                    .constraintEqualToAnchor_constant(&vev_view.leadingAnchor(), pad),
+                field
+                    .centerYAnchor()
+                    .constraintEqualToAnchor(&vev_view.centerYAnchor()),
+                field
+                    .trailingAnchor()
+                    .constraintEqualToAnchor_constant(&btn_prev.leadingAnchor(), -6.0),
+                btn_prev
+                    .centerYAnchor()
+                    .constraintEqualToAnchor(&vev_view.centerYAnchor()),
+                btn_prev.widthAnchor().constraintEqualToConstant(icon_sz),
+                btn_prev.heightAnchor().constraintEqualToConstant(icon_sz),
+                btn_next
+                    .leadingAnchor()
+                    .constraintEqualToAnchor_constant(&btn_prev.trailingAnchor(), 2.0),
+                btn_next
+                    .centerYAnchor()
+                    .constraintEqualToAnchor(&vev_view.centerYAnchor()),
+                btn_next.widthAnchor().constraintEqualToConstant(icon_sz),
+                btn_next.heightAnchor().constraintEqualToConstant(icon_sz),
+                btn_close
+                    .leadingAnchor()
+                    .constraintEqualToAnchor_constant(&btn_next.trailingAnchor(), 6.0),
+                btn_close
+                    .trailingAnchor()
+                    .constraintEqualToAnchor_constant(&vev_view.trailingAnchor(), -pad),
+                btn_close
+                    .centerYAnchor()
+                    .constraintEqualToAnchor(&vev_view.centerYAnchor()),
+                btn_close.widthAnchor().constraintEqualToConstant(icon_sz),
+                btn_close.heightAnchor().constraintEqualToConstant(icon_sz),
+            ]),
+        );
+
+        // Panel — Titled + FullSizeContentView so it can become key for text input.
+        let style = NSWindowStyleMask::Titled | NSWindowStyleMask::FullSizeContentView;
+        let panel: Retained<NSPanel> = unsafe {
+            msg_send![
+                NSPanel::alloc(mtm),
+                initWithContentRect: NSRect::ZERO,
+                styleMask: style,
+                backing: NSBackingStoreType::Buffered,
+                defer: true
+            ]
+        };
+        panel.setLevel(3);
+        panel.setHasShadow(true);
+        panel.setOpaque(false);
+        panel.setBackgroundColor(Some(&NSColor::clearColor()));
+        panel.setTitlebarAppearsTransparent(true);
+        panel.setTitleVisibility(NSWindowTitleVisibility::Hidden);
+        unsafe { panel.setReleasedWhenClosed(false) };
+        panel.setContentView(Some(&vev));
+
+        let _ = self.ivars().find_field.set(field);
+        let _ = self.ivars().find_panel.set(panel);
+    }
+
+    fn perform_find(&self, backwards: bool) {
+        let Some(field) = self.ivars().find_field.get() else { return };
+        let query = field.stringValue();
+        if query.length() == 0 {
+            return;
+        }
+        let doc = unsafe { self.document() };
+        let Some(doc) = doc else { return };
+        let current_sel = unsafe { self.currentSelection() };
+
+        // NSCaseInsensitiveSearch = 1, NSBackwardsSearch = 4
+        let options = objc2_foundation::NSStringCompareOptions(if backwards { 1 | 4 } else { 1 });
+        let result = unsafe {
+            doc.findString_fromSelection_withOptions(&query, current_sel.as_deref(), options)
+        };
+        if let Some(sel) = result {
+            unsafe {
+                self.setCurrentSelection_animate(Some(&sel), true);
+                self.scrollSelectionToVisible(None);
+            }
+        }
+    }
+
+    fn hide_find_panel(&self) {
+        if let Some(panel) = self.ivars().find_panel.get() {
+            panel.orderOut(None);
+        }
+        // Clear the search highlight.
+        unsafe { self.setCurrentSelection_animate(None, false) };
     }
 
     // ── Annotation helpers ───────────────────────────────────────

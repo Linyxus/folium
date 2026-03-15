@@ -273,6 +273,7 @@ impl AppDelegate {
             ("Copy",       sel!(copy:),       "c"),
             ("Paste",      sel!(paste:),      "v"),
             ("Select All", sel!(selectAll:),  "a"),
+            ("Find\u{2026}", sel!(showFindBar:), "f"),
         ] {
             let item = unsafe {
                 NSMenuItem::initWithTitle_action_keyEquivalent(

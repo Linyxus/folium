@@ -37,6 +37,9 @@ pub struct FoliumPDFViewIvars {
     // Find bar
     find_panel: OnceCell<Retained<NSPanel>>,
     find_field: OnceCell<Retained<NSTextField>>,
+    find_count_label: OnceCell<Retained<NSTextField>>,
+    find_matches: RefCell<Vec<Retained<objc2_pdf_kit::PDFSelection>>>,
+    find_match_index: RefCell<usize>,
 }
 
 define_class!(
@@ -1003,6 +1006,7 @@ impl FoliumPDFView {
         field.setFont(Some(&NSFont::systemFontOfSize(13.0)));
         field.setDrawsBackground(false);
         field.setBezeled(false);
+        field.setFocusRingType(objc2_app_kit::NSFocusRingType::None);
         field.setTranslatesAutoresizingMaskIntoConstraints(false);
         unsafe {
             let _: () = msg_send![&*field, setTarget: &*target];
@@ -1046,6 +1050,17 @@ impl FoliumPDFView {
         );
         btn_close.setKeyEquivalent(ns_string!("\u{1b}")); // Escape
 
+        // Match count label.
+        let count_label = NSTextField::new(mtm);
+        count_label.setEditable(false);
+        count_label.setSelectable(false);
+        count_label.setBezeled(false);
+        count_label.setDrawsBackground(false);
+        count_label.setStringValue(ns_string!(""));
+        count_label.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+        count_label.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        count_label.setTranslatesAutoresizingMaskIntoConstraints(false);
+
         // Glass backdrop.
         let vev = NSVisualEffectView::new(mtm);
         vev.setMaterial(NSVisualEffectMaterial::Popover);
@@ -1053,6 +1068,7 @@ impl FoliumPDFView {
         vev.setState(NSVisualEffectState::Active);
         vev.setWantsLayer(true);
         vev.addSubview(&field);
+        vev.addSubview(&count_label);
         vev.addSubview(&btn_prev);
         vev.addSubview(&btn_next);
         vev.addSubview(&btn_close);
@@ -1064,7 +1080,7 @@ impl FoliumPDFView {
             }
         }
 
-        // Layout: [ field ──────────── ] [▲] [▼] [✕]
+        // Layout: [ field ──────────  N/M ] [▲] [▼] [✕]
         let icon_sz = 18.0;
         let pad = 10.0;
         let vev_view: &objc2_app_kit::NSView = &vev;
@@ -1077,6 +1093,12 @@ impl FoliumPDFView {
                     .centerYAnchor()
                     .constraintEqualToAnchor(&vev_view.centerYAnchor()),
                 field
+                    .trailingAnchor()
+                    .constraintEqualToAnchor_constant(&count_label.leadingAnchor(), -4.0),
+                count_label
+                    .centerYAnchor()
+                    .constraintEqualToAnchor(&vev_view.centerYAnchor()),
+                count_label
                     .trailingAnchor()
                     .constraintEqualToAnchor_constant(&btn_prev.leadingAnchor(), -6.0),
                 btn_prev
@@ -1127,6 +1149,7 @@ impl FoliumPDFView {
         panel.setContentView(Some(&vev));
 
         let _ = self.ivars().find_field.set(field);
+        let _ = self.ivars().find_count_label.set(count_label);
         let _ = self.ivars().find_panel.set(panel);
     }
 
@@ -1134,30 +1157,68 @@ impl FoliumPDFView {
         let Some(field) = self.ivars().find_field.get() else { return };
         let query = field.stringValue();
         if query.length() == 0 {
+            self.update_find_count_label(0, 0);
+            *self.ivars().find_matches.borrow_mut() = vec![];
             return;
         }
         let doc = unsafe { self.document() };
         let Some(doc) = doc else { return };
-        let current_sel = unsafe { self.currentSelection() };
 
-        // NSCaseInsensitiveSearch = 1, NSBackwardsSearch = 4
-        let options = objc2_foundation::NSStringCompareOptions(if backwards { 1 | 4 } else { 1 });
-        let result = unsafe {
-            doc.findString_fromSelection_withOptions(&query, current_sel.as_deref(), options)
-        };
-        if let Some(sel) = result {
-            unsafe {
-                self.setCurrentSelection_animate(Some(&sel), true);
-                self.scrollSelectionToVisible(None);
-            }
+        // Collect all matches (case-insensitive).
+        let options = objc2_foundation::NSStringCompareOptions(1); // NSCaseInsensitiveSearch
+        let all_matches = unsafe { doc.findString_withOptions(&query, options) };
+        let matches: Vec<Retained<objc2_pdf_kit::PDFSelection>> = (0..all_matches.count())
+            .map(|i| all_matches.objectAtIndex(i))
+            .collect();
+
+        let total = matches.len();
+        if total == 0 {
+            self.update_find_count_label(0, 0);
+            *self.ivars().find_matches.borrow_mut() = vec![];
+            unsafe { self.setCurrentSelection_animate(None, false) };
+            return;
         }
+
+        // Determine the next index based on direction.
+        let mut idx = *self.ivars().find_match_index.borrow();
+        let old_matches_len = self.ivars().find_matches.borrow().len();
+        if old_matches_len != total {
+            // Query changed — start from the beginning (or end if backwards).
+            idx = if backwards { total - 1 } else { 0 };
+        } else if backwards {
+            idx = if idx == 0 { total - 1 } else { idx - 1 };
+        } else {
+            idx = if idx + 1 >= total { 0 } else { idx + 1 };
+        }
+
+        *self.ivars().find_matches.borrow_mut() = matches;
+        *self.ivars().find_match_index.borrow_mut() = idx;
+
+        let matches = self.ivars().find_matches.borrow();
+        let sel = &matches[idx];
+        unsafe {
+            self.setCurrentSelection_animate(Some(sel), true);
+            self.scrollSelectionToVisible(None);
+        }
+        self.update_find_count_label(idx + 1, total);
+    }
+
+    fn update_find_count_label(&self, current: usize, total: usize) {
+        let Some(label) = self.ivars().find_count_label.get() else { return };
+        if total == 0 {
+            label.setStringValue(ns_string!(""));
+        } else {
+            let text = NSString::from_str(&format!("{}/{}", current, total));
+            label.setStringValue(&text);
+        }
+        label.sizeToFit();
     }
 
     fn hide_find_panel(&self) {
         if let Some(panel) = self.ivars().find_panel.get() {
             panel.orderOut(None);
         }
-        // Clear the search highlight.
+        *self.ivars().find_matches.borrow_mut() = vec![];
         unsafe { self.setCurrentSelection_animate(None, false) };
     }
 

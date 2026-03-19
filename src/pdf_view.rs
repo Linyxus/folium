@@ -14,7 +14,8 @@ use objc2_foundation::{
     NSRect, NSSize, NSString,
 };
 use objc2_pdf_kit::{
-    PDFAnnotation, PDFAnnotationSubtypeHighlight, PDFView, PDFViewSelectionChangedNotification,
+    PDFAnnotation, PDFAnnotationSubtypeHighlight, PDFSelection, PDFView,
+    PDFViewSelectionChangedNotification,
 };
 
 #[derive(Debug, Default)]
@@ -38,7 +39,9 @@ pub struct FoliumPDFViewIvars {
     find_panel: OnceCell<Retained<NSPanel>>,
     find_field: OnceCell<Retained<NSTextField>>,
     find_count_label: OnceCell<Retained<NSTextField>>,
-    find_matches: RefCell<Vec<Retained<objc2_pdf_kit::PDFSelection>>>,
+    find_query: RefCell<Option<String>>,
+    find_document_id: RefCell<Option<usize>>,
+    find_matches: RefCell<Vec<Retained<PDFSelection>>>,
     find_match_index: RefCell<usize>,
 }
 
@@ -382,6 +385,10 @@ impl FoliumPDFView {
     pub fn new(mtm: MainThreadMarker) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(FoliumPDFViewIvars::default());
         unsafe { objc2::msg_send![super(this), init] }
+    }
+
+    pub fn invalidate_find_results(&self) {
+        self.clear_find_results(true);
     }
 
     // ── Selection observer ───────────────────────────────────────
@@ -1157,41 +1164,36 @@ impl FoliumPDFView {
         let Some(field) = self.ivars().find_field.get() else { return };
         let query = field.stringValue();
         if query.length() == 0 {
-            self.update_find_count_label(0, 0);
-            *self.ivars().find_matches.borrow_mut() = vec![];
+            self.clear_find_results(true);
             return;
         }
-        let doc = unsafe { self.document() };
-        let Some(doc) = doc else { return };
+        let query = query.to_string();
+        let recomputed = match self.refresh_find_matches(&query) {
+            Some(recomputed) => recomputed,
+            None => return,
+        };
 
-        // Collect all matches (case-insensitive).
-        let options = objc2_foundation::NSStringCompareOptions(1); // NSCaseInsensitiveSearch
-        let all_matches = unsafe { doc.findString_withOptions(&query, options) };
-        let matches: Vec<Retained<objc2_pdf_kit::PDFSelection>> = (0..all_matches.count())
-            .map(|i| all_matches.objectAtIndex(i))
-            .collect();
-
-        let total = matches.len();
+        let total = self.ivars().find_matches.borrow().len();
         if total == 0 {
             self.update_find_count_label(0, 0);
-            *self.ivars().find_matches.borrow_mut() = vec![];
             unsafe { self.setCurrentSelection_animate(None, false) };
             return;
         }
 
         // Determine the next index based on direction.
-        let mut idx = *self.ivars().find_match_index.borrow();
-        let old_matches_len = self.ivars().find_matches.borrow().len();
-        if old_matches_len != total {
-            // Query changed — start from the beginning (or end if backwards).
-            idx = if backwards { total - 1 } else { 0 };
-        } else if backwards {
-            idx = if idx == 0 { total - 1 } else { idx - 1 };
-        } else {
-            idx = if idx + 1 >= total { 0 } else { idx + 1 };
-        }
+        let idx = {
+            let current_idx = *self.ivars().find_match_index.borrow();
+            if recomputed {
+                if backwards { total - 1 } else { 0 }
+            } else if backwards {
+                if current_idx == 0 { total - 1 } else { current_idx - 1 }
+            } else if current_idx + 1 >= total {
+                0
+            } else {
+                current_idx + 1
+            }
+        };
 
-        *self.ivars().find_matches.borrow_mut() = matches;
         *self.ivars().find_match_index.borrow_mut() = idx;
 
         let matches = self.ivars().find_matches.borrow();
@@ -1201,6 +1203,48 @@ impl FoliumPDFView {
             self.scrollSelectionToVisible(None);
         }
         self.update_find_count_label(idx + 1, total);
+    }
+
+    fn refresh_find_matches(&self, query: &str) -> Option<bool> {
+        let doc = unsafe { self.document() };
+        let Some(doc) = doc else {
+            self.clear_find_results(true);
+            return None;
+        };
+
+        let document_id = Retained::as_ptr(&doc) as usize;
+        let query_changed = self.ivars().find_query.borrow().as_deref() != Some(query);
+        let document_changed = *self.ivars().find_document_id.borrow() != Some(document_id);
+        if !query_changed && !document_changed {
+            return Some(false);
+        }
+
+        // Collect all matches once per (document, query) pair.
+        let query_ns = NSString::from_str(query);
+        let options = objc2_foundation::NSStringCompareOptions(1); // NSCaseInsensitiveSearch
+        let all_matches = unsafe { doc.findString_withOptions(&query_ns, options) };
+        let matches: Vec<Retained<PDFSelection>> = (0..all_matches.count())
+            .map(|i| all_matches.objectAtIndex(i))
+            .collect();
+
+        *self.ivars().find_query.borrow_mut() = Some(query.to_owned());
+        *self.ivars().find_document_id.borrow_mut() = Some(document_id);
+        *self.ivars().find_matches.borrow_mut() = matches;
+        *self.ivars().find_match_index.borrow_mut() = 0;
+
+        Some(true)
+    }
+
+    fn clear_find_results(&self, clear_selection: bool) {
+        *self.ivars().find_query.borrow_mut() = None;
+        *self.ivars().find_document_id.borrow_mut() = None;
+        self.ivars().find_matches.borrow_mut().clear();
+        *self.ivars().find_match_index.borrow_mut() = 0;
+        self.update_find_count_label(0, 0);
+
+        if clear_selection {
+            unsafe { self.setCurrentSelection_animate(None, false) };
+        }
     }
 
     fn update_find_count_label(&self, current: usize, total: usize) {
@@ -1218,8 +1262,7 @@ impl FoliumPDFView {
         if let Some(panel) = self.ivars().find_panel.get() {
             panel.orderOut(None);
         }
-        *self.ivars().find_matches.borrow_mut() = vec![];
-        unsafe { self.setCurrentSelection_animate(None, false) };
+        self.clear_find_results(true);
     }
 
     // ── Annotation helpers ───────────────────────────────────────

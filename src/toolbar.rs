@@ -172,6 +172,7 @@ impl ToolbarHandler {
 
     pub fn load_url(&self, url: &NSURL) {
         let Some(pv) = self.ivars().pdf_view.get() else { return };
+        pv.invalidate_find_results();
         let doc = unsafe { PDFDocument::initWithURL(PDFDocument::alloc(), url) };
         let Some(doc) = doc else { return };
         unsafe { pv.setDocument(Some(&doc)) };
@@ -209,6 +210,7 @@ impl ToolbarHandler {
         });
 
         // Load the new document.
+        pv.invalidate_find_results();
         let new_doc = unsafe { PDFDocument::initWithURL(PDFDocument::alloc(), &url) };
         let Some(new_doc) = new_doc else { return };
         unsafe { pv.setDocument(Some(&new_doc)) };

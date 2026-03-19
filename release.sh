@@ -22,6 +22,13 @@ fi
 APP_NAME="Folium"
 DMG_PATH="target/release/${APP_NAME}.dmg"
 
+# Auto-detect the GitHub remote.
+GH_REMOTE=$(git remote -v | grep 'github\.com' | head -1 | awk '{print $1}')
+if [ -z "$GH_REMOTE" ]; then
+    echo "Error: no GitHub remote found."
+    exit 1
+fi
+
 echo "==> Releasing ${APP_NAME} ${VERSION}"
 
 if [ "$RELEASE_ONLY" = true ]; then
@@ -31,7 +38,7 @@ if [ "$RELEASE_ONLY" = true ]; then
         exit 1
     fi
     # Verify tag is pushed to remote.
-    if ! git ls-remote --tags gh "${VERSION}" | grep -q "${VERSION}"; then
+    if ! git ls-remote --tags "$GH_REMOTE" "${VERSION}" | grep -q "${VERSION}"; then
         echo "Error: tag ${VERSION} is not pushed to remote."
         exit 1
     fi
@@ -50,7 +57,7 @@ else
     # Tag.
     echo "==> Tagging ${VERSION}..."
     git tag "${VERSION}"
-    git push gh "${VERSION}"
+    git push "$GH_REMOTE" "${VERSION}"
 
     # Build app + DMG.
     echo "==> Building..."

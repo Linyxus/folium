@@ -1,9 +1,17 @@
-use std::cell::{OnceCell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
+use std::fs::File;
+use std::os::fd::{FromRawFd, IntoRawFd, RawFd};
+use std::os::raw::c_void;
 use std::time::SystemTime;
 
+use dispatch::ffi::{
+    dispatch_after_f, dispatch_get_main_queue, dispatch_object_t, dispatch_queue_t,
+    dispatch_release, dispatch_resume, dispatch_set_context, dispatch_set_finalizer_f,
+    dispatch_time, DISPATCH_TIME_NOW,
+};
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2::{define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadOnly};
+use objc2::{define_class, AnyThread, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
     NSModalResponseOK, NSOpenPanel, NSToolbar, NSToolbarDelegate, NSToolbarItem, NSView, NSWindow,
 };
@@ -14,15 +22,106 @@ use objc2_pdf_kit::{PDFDestination, PDFDocument};
 
 use crate::pdf_view::FoliumPDFView;
 
+#[repr(C)]
+struct dispatch_source_type_s {
+    _private: [u8; 0],
+}
+
+type DispatchSource = dispatch_object_t;
+type DispatchSourceType = *const dispatch_source_type_s;
+
+#[link(name = "System", kind = "dylib")]
+unsafe extern "C" {
+    static _dispatch_source_type_vnode: dispatch_source_type_s;
+
+    fn dispatch_source_create(
+        type_: DispatchSourceType,
+        handle: usize,
+        mask: usize,
+        queue: dispatch_queue_t,
+    ) -> DispatchSource;
+    fn dispatch_source_set_event_handler_f(
+        source: DispatchSource,
+        handler: extern "C" fn(*mut c_void),
+    );
+    fn dispatch_source_set_cancel_handler_f(
+        source: DispatchSource,
+        handler: extern "C" fn(*mut c_void),
+    );
+    fn dispatch_source_cancel(source: DispatchSource);
+}
+
+const FILE_WATCH_EVENT_MASK: usize = 0x1 | 0x2 | 0x20 | 0x40;
+const FILE_RELOAD_DEBOUNCE_NS: i64 = 250_000_000;
+
+#[derive(Debug)]
+struct FileWatchSource {
+    raw: DispatchSource,
+}
+
+impl Drop for FileWatchSource {
+    fn drop(&mut self) {
+        unsafe {
+            dispatch_source_cancel(self.raw);
+            dispatch_release(self.raw);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FileWatchContext {
+    handler: *mut ToolbarHandler,
+    fd: RawFd,
+}
+
+#[derive(Debug)]
+struct PendingReloadContext {
+    handler: Retained<ToolbarHandler>,
+    generation: u64,
+}
+
+extern "C" fn file_watch_event_handler(context: *mut c_void) {
+    let context = unsafe { &*(context as *mut FileWatchContext) };
+    let handler = unsafe { &*context.handler };
+    handler.schedule_debounced_reload();
+}
+
+extern "C" fn file_watch_cancel_handler(context: *mut c_void) {
+    let context = unsafe { &mut *(context as *mut FileWatchContext) };
+    if context.fd >= 0 {
+        unsafe {
+            drop(File::from_raw_fd(context.fd));
+        }
+        context.fd = -1;
+    }
+}
+
+extern "C" fn file_watch_finalizer(context: *mut c_void) {
+    unsafe {
+        drop(Box::from_raw(context as *mut FileWatchContext));
+    }
+}
+
+extern "C" fn pending_reload_fire(context: *mut c_void) {
+    let context = unsafe { Box::from_raw(context as *mut PendingReloadContext) };
+    if context
+        .handler
+        .is_reload_generation_current(context.generation)
+    {
+        context.handler.reload_document_if_needed();
+    }
+}
+
 #[derive(Debug)]
 pub struct ToolbarHandlerIvars {
     window:     OnceCell<Retained<NSWindow>>,
     blank_view: OnceCell<Retained<NSView>>,
     pdf_view:   OnceCell<Retained<FoliumPDFView>>,
     // File watcher
+    watch_source: RefCell<Option<FileWatchSource>>,
     watched_path: RefCell<Option<String>>,
     file_mtime:   RefCell<Option<SystemTime>>,
-    watcher_active: RefCell<bool>,
+    reload_generation: Cell<u64>,
 }
 
 impl Default for ToolbarHandlerIvars {
@@ -31,9 +130,10 @@ impl Default for ToolbarHandlerIvars {
             window:     OnceCell::new(),
             blank_view: OnceCell::new(),
             pdf_view:   OnceCell::new(),
+            watch_source: RefCell::new(None),
             watched_path:   RefCell::new(None),
             file_mtime:     RefCell::new(None),
-            watcher_active: RefCell::new(false),
+            reload_generation: Cell::new(0),
         }
     }
 }
@@ -98,29 +198,14 @@ define_class!(
                 }
             }
         }
-
-        #[unsafe(method(_checkFileChanged:))]
-        fn _check_file_changed(&self, _sender: Option<&AnyObject>) {
-            if let Some(path) = self.ivars().watched_path.borrow().as_ref() {
-                if let Ok(meta) = std::fs::metadata(path) {
-                    if let Ok(mtime) = meta.modified() {
-                        let changed = self
-                            .ivars()
-                            .file_mtime
-                            .borrow()
-                            .map_or(false, |old| mtime != old);
-                        if changed {
-                            *self.ivars().file_mtime.borrow_mut() = Some(mtime);
-                            self.reload_document();
-                        }
-                    }
-                }
-            }
-            // Re-schedule in 1 second.
-            self.schedule_file_check();
-        }
     }
 );
+
+impl Drop for ToolbarHandler {
+    fn drop(&mut self) {
+        self.stop_file_watch();
+    }
+}
 
 impl ToolbarHandler {
     pub fn new(mtm: MainThreadMarker) -> Retained<Self> {
@@ -157,17 +242,118 @@ impl ToolbarHandler {
         window.tab().setTitle(Some(&title));
     }
 
-    fn schedule_file_check(&self) {
-        let self_ptr = self as *const ToolbarHandler as *const AnyObject;
-        let null: *const AnyObject = std::ptr::null();
+    fn retained_self(&self) -> Retained<Self> {
         unsafe {
-            let _: () = msg_send![
-                &*self_ptr,
-                performSelector: sel!(_checkFileChanged:),
-                withObject: null,
-                afterDelay: 1.0_f64
-            ];
+            Retained::retain(self as *const Self as *mut Self)
+                .expect("toolbar handler should be retainable")
         }
+    }
+
+    fn next_reload_generation(&self) -> u64 {
+        let next = self.ivars().reload_generation.get().wrapping_add(1);
+        self.ivars().reload_generation.set(next);
+        next
+    }
+
+    fn is_reload_generation_current(&self, generation: u64) -> bool {
+        self.ivars().reload_generation.get() == generation
+    }
+
+    fn schedule_debounced_reload(&self) {
+        if self.ivars().watched_path.borrow().is_none() {
+            return;
+        }
+
+        let generation = self.next_reload_generation();
+        let context = Box::new(PendingReloadContext {
+            handler: self.retained_self(),
+            generation,
+        });
+        let when = unsafe { dispatch_time(DISPATCH_TIME_NOW, FILE_RELOAD_DEBOUNCE_NS) };
+        unsafe {
+            dispatch_after_f(
+                when,
+                dispatch_get_main_queue(),
+                Box::into_raw(context) as *mut c_void,
+                pending_reload_fire,
+            );
+        }
+    }
+
+    fn stop_file_watch(&self) {
+        self.next_reload_generation();
+        self.ivars().watch_source.borrow_mut().take();
+        self.ivars().watched_path.borrow_mut().take();
+        self.ivars().file_mtime.borrow_mut().take();
+    }
+
+    fn start_file_watch(&self, path: &str) {
+        self.stop_file_watch();
+
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(_) => return,
+        };
+        let mtime = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
+        let fd = file.into_raw_fd();
+        let source = unsafe {
+            dispatch_source_create(
+                &_dispatch_source_type_vnode,
+                fd as usize,
+                FILE_WATCH_EVENT_MASK,
+                dispatch_get_main_queue(),
+            )
+        };
+        if source.is_null() {
+            unsafe {
+                drop(File::from_raw_fd(fd));
+            }
+            return;
+        }
+
+        let context = Box::new(FileWatchContext {
+            handler: self as *const Self as *mut Self,
+            fd,
+        });
+        unsafe {
+            dispatch_set_context(source, Box::into_raw(context) as *mut c_void);
+            dispatch_source_set_event_handler_f(source, file_watch_event_handler);
+            dispatch_source_set_cancel_handler_f(source, file_watch_cancel_handler);
+            dispatch_set_finalizer_f(source, file_watch_finalizer);
+            dispatch_resume(source);
+        }
+
+        *self.ivars().watched_path.borrow_mut() = Some(path.to_owned());
+        *self.ivars().file_mtime.borrow_mut() = mtime;
+        *self.ivars().watch_source.borrow_mut() = Some(FileWatchSource { raw: source });
+    }
+
+    fn reload_document_if_needed(&self) {
+        let Some(path) = self.ivars().watched_path.borrow().clone() else {
+            return;
+        };
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                self.stop_file_watch();
+                return;
+            }
+        };
+        let Ok(mtime) = metadata.modified() else {
+            return;
+        };
+        if self
+            .ivars()
+            .file_mtime
+            .borrow()
+            .as_ref()
+            .is_some_and(|old| *old == mtime)
+        {
+            return;
+        }
+
+        *self.ivars().file_mtime.borrow_mut() = Some(mtime);
+        self.reload_document();
     }
 
     pub fn load_url(&self, url: &NSURL) {
@@ -183,15 +369,7 @@ impl ToolbarHandler {
             .and_then(|n| n.to_str())
             .unwrap_or("Document");
         self.transition_to_pdf_view(filename);
-
-        // Start file watching.
-        let mtime = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
-        *self.ivars().watched_path.borrow_mut() = Some(path);
-        *self.ivars().file_mtime.borrow_mut() = mtime;
-        if !*self.ivars().watcher_active.borrow() {
-            *self.ivars().watcher_active.borrow_mut() = true;
-            self.schedule_file_check();
-        }
+        self.start_file_watch(&path);
     }
 
     fn reload_document(&self) {
@@ -208,9 +386,11 @@ impl ToolbarHandler {
             let page = unsafe { dest.page() }?;
             Some(unsafe { doc.indexForPage(&page) })
         });
+        let path = url.path().expect("URL has no path").to_string();
 
         // Load the new document.
         pv.invalidate_find_results();
+        self.start_file_watch(&path);
         let new_doc = unsafe { PDFDocument::initWithURL(PDFDocument::alloc(), &url) };
         let Some(new_doc) = new_doc else { return };
         unsafe { pv.setDocument(Some(&new_doc)) };

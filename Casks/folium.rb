@@ -14,6 +14,13 @@ cask "folium" do
 
   app "Folium.app"
 
+  # The app isn't notarized; strip the download quarantine so first launch
+  # doesn't trip Gatekeeper's "unidentified developer" dialog.
+  postflight do
+    system_command "/usr/bin/xattr",
+                   args: ["-dr", "com.apple.quarantine", "#{appdir}/Folium.app"]
+  end
+
   zap trash: [
     "~/Library/Preferences/com.linyxus.folium.plist",
     "~/Library/Saved Application State/com.linyxus.folium.savedState",

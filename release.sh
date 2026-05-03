@@ -21,6 +21,9 @@ fi
 
 APP_NAME="Folium"
 DMG_PATH="target/release/${APP_NAME}.dmg"
+CASK_PATH="Casks/folium.rb"
+# Cask version field is unprefixed; URL re-adds the leading "v".
+CASK_VERSION="${VERSION#v}"
 
 # Auto-detect the GitHub remote.
 GH_REMOTE=$(git remote -v | grep 'github\.com' | head -1 | awk '{print $1}')
@@ -54,14 +57,28 @@ else
         exit 1
     fi
 
-    # Tag.
-    echo "==> Tagging ${VERSION}..."
-    git tag "${VERSION}"
-    git push "$GH_REMOTE" "${VERSION}"
-
-    # Build app + DMG.
+    # Build app + DMG. Done before tagging so the tag commit can include
+    # the matching cask update.
     echo "==> Building..."
     ./build.sh --dmg
+
+    # Update cask with new version + sha256.
+    SHA256=$(shasum -a 256 "${DMG_PATH}" | awk '{print $1}')
+    echo "==> Updating ${CASK_PATH} (version=${CASK_VERSION}, sha256=${SHA256})..."
+    sed -i '' -E "s|^  version \"[^\"]*\"|  version \"${CASK_VERSION}\"|" "${CASK_PATH}"
+    sed -i '' -E "s|^  sha256 \"[^\"]*\"|  sha256 \"${SHA256}\"|" "${CASK_PATH}"
+
+    if ! git diff --quiet -- "${CASK_PATH}"; then
+        echo "==> Committing cask update..."
+        git add "${CASK_PATH}"
+        git commit -m "Release ${VERSION}"
+    fi
+
+    # Tag, then push branch + tag together.
+    echo "==> Tagging ${VERSION}..."
+    git tag "${VERSION}"
+    git push "$GH_REMOTE" HEAD
+    git push "$GH_REMOTE" "${VERSION}"
 fi
 
 # Publish GitHub release.

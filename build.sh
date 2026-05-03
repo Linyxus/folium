@@ -74,6 +74,14 @@ cat > "${CONTENTS_DIR}/Info.plist" << 'PLIST'
 PLIST
 
 echo "    Created Info.plist"
+
+# Ad-hoc sign so the binary launches on Apple Silicon without "killed".
+# Gatekeeper still warns about unidentified developer on first launch
+# (right-click → Open). For a clean first-launch UX, sign with a real
+# Developer ID and notarize.
+echo "==> Signing app bundle (ad-hoc)..."
+codesign --force --sign - "${APP_DIR}"
+
 echo "==> App bundle: ${APP_DIR}"
 
 if [ "${1:-}" = "--dmg" ]; then

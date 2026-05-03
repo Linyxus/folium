@@ -4,18 +4,18 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSBackingStoreType, NSButton, NSColor, NSEvent, NSFont, NSImage, NSPanel, NSScrollView,
-    NSTextField, NSTextView, NSTrackingArea, NSTrackingAreaOptions, NSVisualEffectBlendingMode,
-    NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindowStyleMask,
-    NSWindowTitleVisibility,
+    NSBackingStoreType, NSButton, NSColor, NSEvent, NSFont, NSImage, NSLayoutConstraint, NSPanel,
+    NSScrollView, NSTextField, NSTextView, NSTrackingArea, NSTrackingAreaOptions,
+    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
+    NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_foundation::{
-    ns_string, MainThreadMarker, NSNotification, NSNotificationCenter, NSObjectProtocol, NSPoint,
-    NSRect, NSSize, NSString,
+    ns_string, MainThreadMarker, NSArray, NSNotification, NSNotificationCenter, NSObjectProtocol,
+    NSPoint, NSRect, NSSize, NSString,
 };
 use objc2_pdf_kit::{
-    PDFAnnotation, PDFAnnotationSubtypeHighlight, PDFSelection, PDFView,
-    PDFViewSelectionChangedNotification,
+    PDFAnnotation, PDFAnnotationSubtypeHighlight, PDFDocument, PDFSelection, PDFView,
+    PDFViewPageChangedNotification, PDFViewSelectionChangedNotification,
 };
 
 #[derive(Debug, Default)]
@@ -28,7 +28,10 @@ pub struct FoliumPDFViewIvars {
     tooltip_label: OnceCell<Retained<NSTextField>>,
     // Selection action panel (highlight pill)
     action_panel: OnceCell<Retained<NSPanel>>,
-    selection_observer_registered: OnceCell<()>,
+    observers_registered: OnceCell<()>,
+    // Page indicator overlay (bottom-right)
+    page_indicator: OnceCell<Retained<NSVisualEffectView>>,
+    page_indicator_label: OnceCell<Retained<NSTextField>>,
     // Annotation action bar (delete / colors / note)
     annotation_bar: OnceCell<Retained<NSPanel>>,
     // Note editor
@@ -310,14 +313,27 @@ define_class!(
             }
         }
 
+        // ── Page change ──────────────────────────────────────────
+
+        #[unsafe(method(pageDidChange:))]
+        fn page_did_change(&self, _notification: &NSNotification) {
+            self.update_page_indicator();
+        }
+
+        #[unsafe(method(setDocument:))]
+        fn set_document_override(&self, doc: Option<&PDFDocument>) {
+            unsafe { let _: () = msg_send![super(self), setDocument: doc]; }
+            self.update_page_indicator();
+        }
+
         // ── Tooltip tracking ─────────────────────────────────────
 
         #[unsafe(method(updateTrackingAreas))]
         fn update_tracking_areas(&self) {
             unsafe { msg_send![super(self), updateTrackingAreas] }
-            if self.ivars().selection_observer_registered.get().is_none() {
-                self.register_selection_observer();
-                let _ = self.ivars().selection_observer_registered.set(());
+            if self.ivars().observers_registered.get().is_none() {
+                self.register_observers();
+                let _ = self.ivars().observers_registered.set(());
             }
             if self.ivars().tooltip_tracking.get().is_some() {
                 return;
@@ -391,9 +407,9 @@ impl FoliumPDFView {
         self.clear_find_results(true);
     }
 
-    // ── Selection observer ───────────────────────────────────────
+    // ── Notification observers ───────────────────────────────────
 
-    fn register_selection_observer(&self) {
+    fn register_observers(&self) {
         let center = NSNotificationCenter::defaultCenter();
         let observer = self as *const FoliumPDFView as *const AnyObject;
         let object = self as *const FoliumPDFView as *const AnyObject;
@@ -404,7 +420,90 @@ impl FoliumPDFView {
                 Some(&PDFViewSelectionChangedNotification),
                 Some(&*object),
             );
+            center.addObserver_selector_name_object(
+                &*observer,
+                sel!(pageDidChange:),
+                Some(&PDFViewPageChangedNotification),
+                Some(&*object),
+            );
         }
+    }
+
+    // ── Page indicator ───────────────────────────────────────────
+
+    fn ensure_page_indicator(&self) {
+        if self.ivars().page_indicator.get().is_some() {
+            return;
+        }
+        let mtm = MainThreadMarker::from(self);
+        let h = 26.0_f64;
+
+        let vev = NSVisualEffectView::new(mtm);
+        vev.setMaterial(NSVisualEffectMaterial::HUDWindow);
+        vev.setBlendingMode(NSVisualEffectBlendingMode::WithinWindow);
+        vev.setState(NSVisualEffectState::Active);
+        vev.setWantsLayer(true);
+        unsafe {
+            if let Some(layer) = vev.layer() {
+                let _: () = msg_send![&*layer, setCornerRadius: h / 2.0];
+                let _: () = msg_send![&*layer, setMasksToBounds: true];
+            }
+        }
+
+        let label = NSTextField::new(mtm);
+        label.setEditable(false);
+        label.setSelectable(false);
+        label.setBezeled(false);
+        label.setDrawsBackground(false);
+        // Monospaced digits keep "3 / 42" stable as the count rolls over.
+        label.setFont(Some(&NSFont::monospacedDigitSystemFontOfSize_weight(11.0, 0.23)));
+        label.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        label.setStringValue(ns_string!(""));
+        label.setTranslatesAutoresizingMaskIntoConstraints(false);
+
+        vev.addSubview(&label);
+        vev.setTranslatesAutoresizingMaskIntoConstraints(false);
+        vev.setHidden(true);
+        self.addSubview(&vev);
+
+        NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
+            vev.trailingAnchor()
+                .constraintEqualToAnchor_constant(&self.trailingAnchor(), -16.0),
+            vev.bottomAnchor()
+                .constraintEqualToAnchor_constant(&self.bottomAnchor(), -16.0),
+            vev.heightAnchor().constraintEqualToConstant(h),
+            label.leadingAnchor()
+                .constraintEqualToAnchor_constant(&vev.leadingAnchor(), 12.0),
+            label.trailingAnchor()
+                .constraintEqualToAnchor_constant(&vev.trailingAnchor(), -12.0),
+            label.centerYAnchor().constraintEqualToAnchor(&vev.centerYAnchor()),
+        ]));
+
+        let _ = self.ivars().page_indicator.set(vev);
+        let _ = self.ivars().page_indicator_label.set(label);
+    }
+
+    fn update_page_indicator(&self) {
+        self.ensure_page_indicator();
+        let Some(vev) = self.ivars().page_indicator.get() else { return };
+        let Some(label) = self.ivars().page_indicator_label.get() else { return };
+
+        let Some(doc) = (unsafe { self.document() }) else {
+            vev.setHidden(true);
+            return;
+        };
+        let total = unsafe { doc.pageCount() };
+        if total == 0 {
+            vev.setHidden(true);
+            return;
+        }
+        let current_idx = unsafe { self.currentPage() }
+            .map(|p| unsafe { doc.indexForPage(&p) })
+            .unwrap_or(0);
+
+        let text = NSString::from_str(&format!("{} / {}", current_idx + 1, total));
+        label.setStringValue(&text);
+        vev.setHidden(false);
     }
 
     // ── Annotation action bar ────────────────────────────────────

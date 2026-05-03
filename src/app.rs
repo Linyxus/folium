@@ -9,6 +9,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{
     ns_string, MainThreadMarker, NSArray, NSNotification, NSObject, NSObjectProtocol, NSString,
+    NSURL,
 };
 
 use crate::tab::{self, TabController};
@@ -39,36 +40,30 @@ define_class!(
             app.activateIgnoringOtherApps(true);
 
             let cli_paths = crate::CLI_PATHS.get().cloned().unwrap_or_default();
-            if cli_paths.is_empty() {
+            if !cli_paths.is_empty() {
+                self.open_paths(&cli_paths, mtm);
+            }
+
+            // application:openURLs: fires *before* didFinishLaunching, so
+            // openURLs may have already populated tabs. Only create the
+            // empty starter tab when nothing else opened anything.
+            if self.ivars().tabs.borrow().is_empty() {
                 let tab = TabController::new(mtm);
                 tab.window.setDelegate(Some(ProtocolObject::from_ref(self)));
                 tab.window.makeKeyAndOrderFront(None);
                 tab::update_tab_shortcuts(&tab.window, mtm);
                 self.ivars().tabs.borrow_mut().push(tab);
-            } else {
-                for (i, path) in cli_paths.iter().enumerate() {
-                    let tab = TabController::new(mtm);
-                    tab.window.setDelegate(Some(ProtocolObject::from_ref(self)));
-                    tab.load_file(path);
-                    if i == 0 {
-                        tab.window.makeKeyAndOrderFront(None);
-                    } else {
-                        let tabs = self.ivars().tabs.borrow();
-                        if let Some(first) = tabs.first() {
-                            first.window.addTabbedWindow_ordered(
-                                &tab.window,
-                                NSWindowOrderingMode::Above,
-                            );
-                        }
-                        tab.window.makeKeyAndOrderFront(None);
-                    }
-                    self.ivars().tabs.borrow_mut().push(tab);
-                }
-                // Set shortcuts based on actual tab group order.
-                let tabs = self.ivars().tabs.borrow();
-                if let Some(first) = tabs.first() {
-                    tab::update_tab_shortcuts(&first.window, mtm);
-                }
+            }
+        }
+
+        #[unsafe(method(application:openURLs:))]
+        fn application_open_urls(&self, _app: &NSApplication, urls: &NSArray<NSURL>) {
+            let mtm = MainThreadMarker::from(self);
+            let paths: Vec<String> = (0..urls.count())
+                .filter_map(|i| urls.objectAtIndex(i).path().map(|p| p.to_string()))
+                .collect();
+            if !paths.is_empty() {
+                self.open_paths(&paths, mtm);
             }
         }
     }
@@ -121,54 +116,14 @@ define_class!(
             panel.setAllowsMultipleSelection(true);
             #[allow(deprecated)]
             panel.setAllowedFileTypes(Some(&NSArray::from_slice(&[ns_string!("pdf")])));
-            let result = panel.runModal();
-            if result != NSModalResponseOK {
+            if panel.runModal() != NSModalResponseOK {
                 return;
             }
             let urls = panel.URLs();
-            let mut first_file = true;
-            for i in 0..urls.count() {
-                let url = urls.objectAtIndex(i);
-                let path = url.path().expect("URL has no path").to_string();
-
-                // Reuse the focused tab if it has no document open.
-                if first_file {
-                    let app = NSApplication::sharedApplication(mtm);
-                    if let Some(key_win) = app.keyWindow() {
-                        let key_ptr = objc2::rc::Retained::as_ptr(&key_win);
-                        let tabs = self.ivars().tabs.borrow();
-                        if let Some(current) = tabs.iter().find(|t| {
-                            objc2::rc::Retained::as_ptr(&t.window) == key_ptr
-                        }) {
-                            if !current.has_document() {
-                                current.load_file(&path);
-                                first_file = false;
-                                continue;
-                            }
-                        }
-                    }
-                }
-                first_file = false;
-
-                let tab = TabController::new(mtm);
-                tab.window.setDelegate(Some(ProtocolObject::from_ref(self)));
-                tab.load_file(&path);
-                {
-                    let tabs = self.ivars().tabs.borrow();
-                    if let Some(first) = tabs.first() {
-                        first.window.addTabbedWindow_ordered(
-                            &tab.window,
-                            NSWindowOrderingMode::Above,
-                        );
-                    }
-                }
-                tab.window.makeKeyAndOrderFront(None);
-                self.ivars().tabs.borrow_mut().push(tab);
-            }
-            let tabs = self.ivars().tabs.borrow();
-            if let Some(first) = tabs.first() {
-                tab::update_tab_shortcuts(&first.window, mtm);
-            }
+            let paths: Vec<String> = (0..urls.count())
+                .filter_map(|i| urls.objectAtIndex(i).path().map(|p| p.to_string()))
+                .collect();
+            self.open_paths(&paths, mtm);
         }
 
         #[unsafe(method(newWindowForTab:))]
@@ -201,6 +156,52 @@ impl AppDelegate {
     pub fn new(mtm: MainThreadMarker) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(AppDelegateIvars::default());
         unsafe { msg_send![super(this), init] }
+    }
+
+    /// Open a list of file paths as tabs. The first path reuses the focused
+    /// tab when it has no document loaded; the rest open as new tabs in the
+    /// existing tab group.
+    fn open_paths(&self, paths: &[String], mtm: MainThreadMarker) {
+        let mut first_file = true;
+        for path in paths {
+            if first_file {
+                let app = NSApplication::sharedApplication(mtm);
+                if let Some(key_win) = app.keyWindow() {
+                    let key_ptr = Retained::as_ptr(&key_win);
+                    let tabs = self.ivars().tabs.borrow();
+                    if let Some(current) = tabs
+                        .iter()
+                        .find(|t| Retained::as_ptr(&t.window) == key_ptr)
+                    {
+                        if !current.has_document() {
+                            current.load_file(path);
+                            first_file = false;
+                            continue;
+                        }
+                    }
+                }
+            }
+            first_file = false;
+
+            let tab = TabController::new(mtm);
+            tab.window.setDelegate(Some(ProtocolObject::from_ref(self)));
+            tab.load_file(path);
+            {
+                let tabs = self.ivars().tabs.borrow();
+                if let Some(first) = tabs.first() {
+                    first.window.addTabbedWindow_ordered(
+                        &tab.window,
+                        NSWindowOrderingMode::Above,
+                    );
+                }
+            }
+            tab.window.makeKeyAndOrderFront(None);
+            self.ivars().tabs.borrow_mut().push(tab);
+        }
+        let tabs = self.ivars().tabs.borrow();
+        if let Some(first) = tabs.first() {
+            tab::update_tab_shortcuts(&first.window, mtm);
+        }
     }
 
     fn build_main_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {

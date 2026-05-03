@@ -1,6 +1,6 @@
 cask "folium" do
-  version "0.1.3"
-  sha256 "bb310b57bcf278e13273b76ab06561d5f0cc999385dceeb9fd9e74a82a497a95"
+  version "0.1.4"
+  sha256 "44d3835f327d9dd5478768de19a3ad3233c86d187ffa8837446455b62859a0a6"
 
   url "https://github.com/Linyxus/folium/releases/download/v#{version}/Folium.dmg"
   name "Folium"

@@ -1,8 +1,10 @@
 use std::cell::{OnceCell, RefCell};
+use std::ptr::NonNull;
 
+use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2::{define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadOnly};
+use objc2::{define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadOnly, Message};
 use objc2_app_kit::{
     NSBackingStoreType, NSButton, NSColor, NSEvent, NSFont, NSImage, NSLayoutConstraint, NSPanel,
     NSScrollView, NSTextField, NSTextView, NSTrackingArea, NSTrackingAreaOptions,
@@ -11,10 +13,10 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{
     ns_string, MainThreadMarker, NSArray, NSNotification, NSNotificationCenter, NSObjectProtocol,
-    NSPoint, NSRect, NSSize, NSString,
+    NSPoint, NSRect, NSSize, NSString, NSUndoManager,
 };
 use objc2_pdf_kit::{
-    PDFAnnotation, PDFAnnotationSubtypeHighlight, PDFDocument, PDFSelection, PDFView,
+    PDFAnnotation, PDFAnnotationSubtypeHighlight, PDFDocument, PDFPage, PDFSelection, PDFView,
     PDFViewPageChangedNotification, PDFViewSelectionChangedNotification,
 };
 
@@ -46,6 +48,8 @@ pub struct FoliumPDFViewIvars {
     find_document_id: RefCell<Option<usize>>,
     find_matches: RefCell<Vec<Retained<PDFSelection>>>,
     find_match_index: RefCell<usize>,
+    // Undo / redo
+    undo_manager: OnceCell<Retained<NSUndoManager>>,
 }
 
 define_class!(
@@ -59,6 +63,50 @@ define_class!(
     unsafe impl NSObjectProtocol for FoliumPDFView {}
 
     impl FoliumPDFView {
+        // ── Undo manager (NSResponder override) ──────────────────
+
+        #[unsafe(method_id(undoManager))]
+        fn undo_manager_method(&self) -> Option<Retained<NSUndoManager>> {
+            Some(self.ensure_undo_manager())
+        }
+
+        // NSWindow's default `undo:` ignores the firstResponder's
+        // undoManager — it uses its own. Handling these selectors here
+        // intercepts Cmd+Z / Cmd+Shift+Z before the chain reaches NSWindow.
+
+        #[unsafe(method(undo:))]
+        fn undo_action(&self, _sender: Option<&AnyObject>) {
+            let mgr = self.ensure_undo_manager();
+            if mgr.canUndo() {
+                mgr.undo();
+            }
+        }
+
+        #[unsafe(method(redo:))]
+        fn redo_action(&self, _sender: Option<&AnyObject>) {
+            let mgr = self.ensure_undo_manager();
+            if mgr.canRedo() {
+                mgr.redo();
+            }
+        }
+
+        // ── Keyboard ─────────────────────────────────────────────
+
+        #[unsafe(method(keyDown:))]
+        fn key_down(&self, event: &NSEvent) {
+            // 51 = Backspace, 117 = Forward Delete
+            let kc = event.keyCode();
+            if (kc == 51 || kc == 117)
+                && self.ivars().active_annotation.borrow().is_some()
+            {
+                let _: () = unsafe {
+                    msg_send![self, deleteAnnotation: std::ptr::null::<AnyObject>()]
+                };
+                return;
+            }
+            unsafe { let _: () = msg_send![super(self), keyDown: event]; }
+        }
+
         // ── Mouse handling ───────────────────────────────────────
 
         #[unsafe(method(mouseDown:))]
@@ -107,16 +155,13 @@ define_class!(
 
         #[unsafe(method(deleteAnnotation:))]
         fn delete_annotation(&self, _sender: Option<&AnyObject>) {
-            {
-                let ann = self.ivars().active_annotation.borrow();
-                let Some(ref a) = *ann else { return };
-                if let Some(page) = unsafe { a.page() } {
-                    unsafe { page.removeAnnotation(a) };
-                }
-            }
-            self.hide_annotation_bar();
-            *self.ivars().active_annotation.borrow_mut() = None;
-            self.mark_edited();
+            let (ann, page) = {
+                let active = self.ivars().active_annotation.borrow();
+                let Some(ref a) = *active else { return };
+                let Some(page) = (unsafe { a.page() }) else { return };
+                (a.clone(), page)
+            };
+            self.perform_remove_annotation(ann, page);
         }
 
         #[unsafe(method(addAnnotationNote:))]
@@ -178,10 +223,9 @@ define_class!(
                     )
                 };
                 unsafe { annotation.setColor(&color) };
-                unsafe { page.addAnnotation(&annotation) };
+                self.perform_add_annotation(annotation, page);
             }
             unsafe { self.clearSelection() };
-            self.mark_edited();
         }
 
         #[unsafe(method(highlightAndAddNote:))]
@@ -204,13 +248,12 @@ define_class!(
                     )
                 };
                 unsafe { annotation.setColor(&color) };
-                unsafe { page.addAnnotation(&annotation) };
+                self.perform_add_annotation(annotation.clone(), page);
                 if first_annotation.is_none() {
                     first_annotation = Some(annotation);
                 }
             }
             unsafe { self.clearSelection() };
-            self.mark_edited();
 
             if let Some(annotation) = first_annotation {
                 self.show_note_editor(annotation);
@@ -223,17 +266,15 @@ define_class!(
         fn save_note(&self, _sender: Option<&AnyObject>) {
             if let Some(text_view) = self.ivars().note_text_view.get() {
                 let note = text_view.string();
-                let ann = self.ivars().note_annotation.borrow();
-                if let Some(ref a) = *ann {
-                    if note.length() > 0 {
-                        unsafe { a.setContents(Some(&note)) };
-                    } else {
-                        unsafe { a.setContents(None) };
-                    }
+                let annotation = {
+                    let ann = self.ivars().note_annotation.borrow();
+                    ann.as_ref().map(|a| a.clone())
+                };
+                if let Some(a) = annotation {
+                    self.perform_set_contents(a, note);
                 }
             }
             self.hide_note_editor();
-            self.mark_edited();
         }
 
         #[unsafe(method(cancelNote:))]
@@ -323,6 +364,9 @@ define_class!(
         #[unsafe(method(setDocument:))]
         fn set_document_override(&self, doc: Option<&PDFDocument>) {
             unsafe { let _: () = msg_send![super(self), setDocument: doc]; }
+            if let Some(mgr) = self.ivars().undo_manager.get() {
+                mgr.removeAllActions();
+            }
             self.update_page_indicator();
         }
 
@@ -715,6 +759,10 @@ impl FoliumPDFView {
         if let Some(panel) = self.ivars().annotation_bar.get() {
             panel.orderOut(None);
         }
+        // Clearing the ivar keeps "annotation visually selected" in sync with
+        // "active_annotation is Some" — Backspace and color changes both
+        // gate on the ivar.
+        *self.ivars().active_annotation.borrow_mut() = None;
     }
 
     // ── Selection action panel (highlight pill) ──────────────────
@@ -1367,10 +1415,145 @@ impl FoliumPDFView {
     // ── Annotation helpers ───────────────────────────────────────
 
     fn set_active_annotation_color(&self, color: &NSColor) {
-        let ann = self.ivars().active_annotation.borrow();
-        let Some(ref a) = *ann else { return };
-        unsafe { a.setColor(color) };
-        drop(ann);
+        let annotation = {
+            let ann = self.ivars().active_annotation.borrow();
+            match *ann {
+                Some(ref a) => a.clone(),
+                None => return,
+            }
+        };
+        // Retain `color` so the perform helper owns it.
+        let color: Retained<NSColor> = color.retain();
+        self.perform_set_color(annotation, color);
+    }
+
+    fn ensure_undo_manager(&self) -> Retained<NSUndoManager> {
+        let mtm = MainThreadMarker::from(self);
+        self.ivars()
+            .undo_manager
+            .get_or_init(|| NSUndoManager::new(mtm))
+            .clone()
+    }
+
+    // ── Block-based undoable mutations ───────────────────────────
+    //
+    // Each `perform_*` registers its inverse on the undo manager *before*
+    // performing the mutation. NSUndoManager flips between isUndoing /
+    // isRedoing while running, so the same registration call inside an
+    // inverse populates the redo stack — no conditional logic needed.
+
+    fn upcast_to_any_object(&self) -> &AnyObject {
+        unsafe { &*(self as *const Self as *const AnyObject) }
+    }
+
+    fn perform_add_annotation(
+        &self,
+        ann: Retained<PDFAnnotation>,
+        page: Retained<PDFPage>,
+    ) {
+        let mgr = self.ensure_undo_manager();
+        let ann_for_inverse = ann.clone();
+        let page_for_inverse = page.clone();
+        let block = RcBlock::new(move |target: NonNull<AnyObject>| {
+            let view: &FoliumPDFView = unsafe {
+                &*(target.as_ptr() as *const FoliumPDFView)
+            };
+            view.perform_remove_annotation(
+                ann_for_inverse.clone(),
+                page_for_inverse.clone(),
+            );
+        });
+        unsafe {
+            mgr.registerUndoWithTarget_handler(self.upcast_to_any_object(), &block);
+        }
+        mgr.setActionName(ns_string!("Add Highlight"));
+        unsafe { page.addAnnotation(&ann) };
+        self.mark_edited();
+    }
+
+    fn perform_remove_annotation(
+        &self,
+        ann: Retained<PDFAnnotation>,
+        page: Retained<PDFPage>,
+    ) {
+        let mgr = self.ensure_undo_manager();
+        let ann_for_inverse = ann.clone();
+        let page_for_inverse = page.clone();
+        let block = RcBlock::new(move |target: NonNull<AnyObject>| {
+            let view: &FoliumPDFView = unsafe {
+                &*(target.as_ptr() as *const FoliumPDFView)
+            };
+            view.perform_add_annotation(
+                ann_for_inverse.clone(),
+                page_for_inverse.clone(),
+            );
+        });
+        unsafe {
+            mgr.registerUndoWithTarget_handler(self.upcast_to_any_object(), &block);
+        }
+        mgr.setActionName(ns_string!("Delete Annotation"));
+
+        let is_active = self
+            .ivars()
+            .active_annotation
+            .borrow()
+            .as_ref()
+            .map(|a| Retained::as_ptr(a) == Retained::as_ptr(&ann))
+            .unwrap_or(false);
+
+        unsafe { page.removeAnnotation(&ann) };
+        if is_active {
+            self.hide_annotation_bar();
+        }
+        self.mark_edited();
+    }
+
+    fn perform_set_color(
+        &self,
+        ann: Retained<PDFAnnotation>,
+        color: Retained<NSColor>,
+    ) {
+        let old: Retained<NSColor> = unsafe { ann.color() };
+        let mgr = self.ensure_undo_manager();
+        let ann_for_inverse = ann.clone();
+        let block = RcBlock::new(move |target: NonNull<AnyObject>| {
+            let view: &FoliumPDFView = unsafe {
+                &*(target.as_ptr() as *const FoliumPDFView)
+            };
+            view.perform_set_color(ann_for_inverse.clone(), old.clone());
+        });
+        unsafe {
+            mgr.registerUndoWithTarget_handler(self.upcast_to_any_object(), &block);
+        }
+        mgr.setActionName(ns_string!("Change Color"));
+        unsafe { ann.setColor(&color) };
+        self.mark_edited();
+    }
+
+    fn perform_set_contents(
+        &self,
+        ann: Retained<PDFAnnotation>,
+        contents: Retained<NSString>,
+    ) {
+        let old: Retained<NSString> = unsafe { ann.contents() }
+            .unwrap_or_else(|| NSString::from_str(""));
+        let mgr = self.ensure_undo_manager();
+        let ann_for_inverse = ann.clone();
+        let block = RcBlock::new(move |target: NonNull<AnyObject>| {
+            let view: &FoliumPDFView = unsafe {
+                &*(target.as_ptr() as *const FoliumPDFView)
+            };
+            view.perform_set_contents(ann_for_inverse.clone(), old.clone());
+        });
+        unsafe {
+            mgr.registerUndoWithTarget_handler(self.upcast_to_any_object(), &block);
+        }
+        mgr.setActionName(ns_string!("Edit Note"));
+        if contents.length() > 0 {
+            unsafe { ann.setContents(Some(&contents)) };
+        } else {
+            unsafe { ann.setContents(None) };
+        }
         self.mark_edited();
     }
 

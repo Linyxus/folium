@@ -72,6 +72,15 @@ impl TabController {
     pub fn has_document(&self) -> bool {
         self.handler.has_document()
     }
+
+    /// Tear down the tab's file watcher before its window finishes closing.
+    /// A pending debounced reload holds a strong reference to the handler, so
+    /// relying on `Drop` alone would let that reload fire against the
+    /// already-closed view. Stopping the watch here invalidates the pending
+    /// reload so it becomes a no-op.
+    pub fn prepare_for_close(&self) {
+        self.handler.prepare_for_close();
+    }
 }
 
 /// Update the ⌘N shortcut labels on all tabs based on their visual order

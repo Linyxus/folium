@@ -225,6 +225,18 @@ impl ToolbarHandler {
         self.ivars().pdf_view.set(view).unwrap();
     }
 
+    /// Cancel the file watcher and invalidate any in-flight debounced reload.
+    ///
+    /// Called from `windowWillClose:` so a reload scheduled just before the tab
+    /// closed does not run against the torn-down view. `stop_file_watch` bumps
+    /// the reload generation (so a queued `pending_reload_fire` skips) and
+    /// clears `watched_path` (so `reload_document_if_needed` bails early) —
+    /// both guard the closed-tab case even though the handler itself stays
+    /// alive until the pending reload's strong reference is released.
+    pub fn prepare_for_close(&self) {
+        self.stop_file_watch();
+    }
+
     pub fn has_document(&self) -> bool {
         self.ivars()
             .pdf_view

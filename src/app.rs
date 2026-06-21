@@ -77,6 +77,20 @@ define_class!(
 
             // Remove the closed tab from our tracking vec.
             let win_ptr = window as *const NSWindow;
+
+            // Tear down the closing tab's file watcher *before* dropping it.
+            // A pending debounced reload keeps the handler alive (strong ref),
+            // so its Drop — and thus the watch teardown — would otherwise be
+            // deferred, letting the reload fire against the closed view.
+            {
+                let tabs = self.ivars().tabs.borrow();
+                if let Some(closing) =
+                    tabs.iter().find(|t| Retained::as_ptr(&t.window) == win_ptr)
+                {
+                    closing.prepare_for_close();
+                }
+            }
+
             self.ivars().tabs.borrow_mut().retain(|t| {
                 Retained::as_ptr(&t.window) != win_ptr
             });

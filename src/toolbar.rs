@@ -225,16 +225,29 @@ impl ToolbarHandler {
         self.ivars().pdf_view.set(view).unwrap();
     }
 
-    /// Cancel the file watcher and invalidate any in-flight debounced reload.
+    /// Tear down per-tab state from `windowWillClose:`, while the view's Rust
+    /// ivars are still alive — i.e. before objc2's generated `dealloc` drops
+    /// them and `[super dealloc]` runs.
     ///
-    /// Called from `windowWillClose:` so a reload scheduled just before the tab
-    /// closed does not run against the torn-down view. `stop_file_watch` bumps
-    /// the reload generation (so a queued `pending_reload_fire` skips) and
-    /// clears `watched_path` (so `reload_document_if_needed` bails early) —
-    /// both guard the closed-tab case even though the handler itself stays
-    /// alive until the pending reload's strong reference is released.
+    /// 1. `stop_file_watch` bumps the reload generation (so a queued
+    ///    `pending_reload_fire` skips) and clears `watched_path` (so
+    ///    `reload_document_if_needed` bails early), keeping a debounced reload
+    ///    from firing against the closing view.
+    ///
+    /// 2. Clearing the document detaches PDFKit's page-view hierarchy *now*.
+    ///    `-[PDFView dealloc]` otherwise releases the document and removes its
+    ///    page views, and `-[PDFPageView viewWillMoveToSuperview:]` calls back
+    ///    into our `undoManager` override — which reads `self.ivars()`. By that
+    ///    point objc2 has already dropped the ivars (it drops them before
+    ///    `[super dealloc]`), so the override dereferences freed memory and
+    ///    crashes (objc_retain on a dangling NSUndoManager). Doing the teardown
+    ///    here runs that same `undoManager` callback while the ivars are valid,
+    ///    leaving nothing for dealloc to tear down.
     pub fn prepare_for_close(&self) {
         self.stop_file_watch();
+        if let Some(pv) = self.ivars().pdf_view.get() {
+            unsafe { pv.setDocument(None) };
+        }
     }
 
     pub fn has_document(&self) -> bool {

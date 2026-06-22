@@ -81,6 +81,15 @@ struct PendingReloadContext {
 }
 
 extern "C" fn file_watch_event_handler(context: *mut c_void) {
+    // SAFETY / LOAD-BEARING INVARIANT: `context.handler` is a non-owning
+    // *mut ToolbarHandler. Dereffing it here is sound ONLY because the dispatch
+    // source targets the main queue (see start_file_watch) and is cancelled on
+    // the main thread (FileWatchSource::drop, reached from prepare_for_close /
+    // ToolbarHandler::Drop). dispatch_source_cancel guarantees the event handler
+    // won't be invoked again after it returns, and main-queue serialization means
+    // this callback can never run concurrently with that cancel. Retarget the
+    // source to a concurrent queue, or cancel/drop the handler off-main, and this
+    // deref becomes a use-after-free race.
     let context = unsafe { &*(context as *mut FileWatchContext) };
     let handler = unsafe { &*context.handler };
     handler.schedule_debounced_reload();
@@ -114,6 +123,15 @@ extern "C" fn pending_reload_fire(context: *mut c_void) {
 
 #[derive(Debug)]
 pub struct ToolbarHandlerIvars {
+    // FIELD ORDER IS LOAD-BEARING: `window` MUST stay before `pdf_view`.
+    // The handler holds a strong ref to the window, and the window owns the
+    // FoliumPDFView as its contentView, so dropping the handler can dealloc the
+    // window inline. objc2 drops ivars top-to-bottom; with `window` first, the
+    // nested window dealloc runs while `pdf_view` is still alive and merely
+    // *removes* the contentView. If `pdf_view` were dropped first, that nested
+    // window dealloc would drop the last ref to the FoliumPDFView mid-drop,
+    // re-entering -[PDFView dealloc] teardown against half-freed handler state
+    // (reviving the undoManager-during-dealloc crash). Do not reorder.
     window:     OnceCell<Retained<NSWindow>>,
     blank_view: OnceCell<Retained<NSView>>,
     pdf_view:   OnceCell<Retained<FoliumPDFView>>,

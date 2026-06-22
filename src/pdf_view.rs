@@ -1377,10 +1377,16 @@ impl FoliumPDFView {
 
         *self.ivars().find_match_index.borrow_mut() = idx;
 
-        let matches = self.ivars().find_matches.borrow();
-        let sel = &matches[idx];
+        // Clone the selection out and release the borrow BEFORE
+        // setCurrentSelection_animate, which synchronously posts
+        // PDFViewSelectionChangedNotification -> selectionDidChange:. Holding
+        // find_matches.borrow() across that re-entrant call would alias the
+        // RefCell the instant any future selectionDidChange:/pageDidChange: path
+        // touches a find_* cell (a RefCell double-borrow aborts the process).
+        // The Retained clone keeps the PDFSelection alive across the call.
+        let sel = self.ivars().find_matches.borrow()[idx].clone();
         unsafe {
-            self.setCurrentSelection_animate(Some(sel), true);
+            self.setCurrentSelection_animate(Some(&sel), true);
             self.scrollSelectionToVisible(None);
         }
         self.update_find_count_label(idx + 1, total);

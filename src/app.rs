@@ -66,6 +66,19 @@ define_class!(
                 self.open_paths(&paths, mtm);
             }
         }
+
+        #[unsafe(method(applicationWillTerminate:))]
+        fn application_will_terminate(&self, _notification: &NSNotification) {
+            // Backstop for the close teardown. Today every tab-release path runs
+            // through windowWillClose: -> prepare_for_close, and terminate: just
+            // exit()s without deallocating views. But should a quit ever tear the
+            // window graph down, run the same teardown here first so no overlay
+            // panel / observer / document is touched after its ivars are freed.
+            // Idempotent with windowWillClose:.
+            for tab in self.ivars().tabs.borrow().iter() {
+                tab.prepare_for_close();
+            }
+        }
     }
 
     unsafe impl NSWindowDelegate for AppDelegate {

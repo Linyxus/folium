@@ -246,6 +246,11 @@ impl ToolbarHandler {
     pub fn prepare_for_close(&self) {
         self.stop_file_watch();
         if let Some(pv) = self.ivars().pdf_view.get() {
+            // Order out overlay panels + remove notification observers while the
+            // view's ivars are alive (audit I7/I8/I1), then detach the document
+            // (the undoManager-during-dealloc fix). Panels first so clearing the
+            // document doesn't churn key-window state through a live panel.
+            pv.prepare_for_close();
             unsafe { pv.setDocument(None) };
         }
     }

@@ -473,6 +473,40 @@ impl FoliumPDFView {
         }
     }
 
+    fn remove_observers(&self) {
+        let center = NSNotificationCenter::defaultCenter();
+        let observer = self as *const FoliumPDFView as *const AnyObject;
+        // Idempotent: a no-op if `self` was never registered.
+        unsafe { center.removeObserver(&*observer) };
+    }
+
+    /// Tear down everything that could be touched once this view starts
+    /// deallocating, while the Rust ivars are still alive. Called from the
+    /// owning tab's `prepare_for_close` (i.e. from `windowWillClose:`), before
+    /// the `FoliumPDFView` is released.
+    ///
+    /// - Orders out the overlay panels. Each is `setReleasedWhenClosed(false)`,
+    ///   owned only by an ivar `OnceCell`, never parented via `addChildWindow:`,
+    ///   and its controls target an *unretained* raw `*const FoliumPDFView`.
+    ///   Left on screen at close, such a panel is either deallocated while still
+    ///   in AppKit's window/responder list, or survives as an orphan that
+    ///   dispatches the next click/keypress to the freed view. `orderOut`
+    ///   removes it from the window list and resigns key/first-responder, so
+    ///   neither can happen. (audit I7/I8)
+    /// - Removes the NSNotificationCenter observers so a `-[PDFView dealloc]`
+    ///   teardown that posts PDFViewPageChanged/SelectionChanged cannot dispatch
+    ///   `pageDidChange:`/`selectionDidChange:` into freed ivars after objc2 has
+    ///   dropped them before `[super dealloc]`. (audit I1; sibling of the
+    ///   `undoManager`-during-dealloc crash)
+    pub fn prepare_for_close(&self) {
+        self.hide_annotation_bar();
+        self.hide_action_panel();
+        self.hide_note_editor();
+        self.hide_find_panel();
+        self.hide_tooltip();
+        self.remove_observers();
+    }
+
     // ── Page indicator ───────────────────────────────────────────
 
     fn ensure_page_indicator(&self) {
